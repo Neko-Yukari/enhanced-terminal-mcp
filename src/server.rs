@@ -1,5 +1,5 @@
 use crate::detection::{detect_binaries, detect_shells};
-use crate::tools::{JobManager, TerminalExecutionInput, execute_command};
+use crate::tools::{JobManager, TerminalExecutionInput, execute_command, preview_output};
 use rmcp::{
     ErrorData as McpError, Peer, handler::server::router::tool::ToolRouter,
     handler::server::wrapper::Parameters, model::*, service::RoleServer, tool, tool_handler,
@@ -47,10 +47,18 @@ pub struct JobStatusInput {
     /// Limit for pagination (bytes to return, default: 0 = all)
     #[serde(default)]
     pub limit: usize,
+    /// Maximum number of GPT-5/o200k_base tokens to return from the selected output chunk.
+    /// Defaults to 4096. Set to 0 to disable token truncation.
+    #[serde(default = "default_preview_tokens")]
+    pub preview_tokens: usize,
 }
 
 fn default_incremental() -> bool {
     true
+}
+
+fn default_preview_tokens() -> usize {
+    4096
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -136,7 +144,7 @@ PARAMETERS:
 - command (string, required): The shell command to execute
 - cwd (string, default: '.'): Working directory for command execution
 - shell (string, default: 'bash'): Shell to use from available shells (see below)
-- output_limit (number, default: 16384): Maximum output size in bytes
+- preview_tokens (number, default: 4096): Maximum GPT-5/o200k_base tokens to return in the initial output preview; set 0 to disable token truncation
 - env_vars (object, default: {}): Environment variables to set (e.g. {\"PATH\": \"/usr/bin\", \"DEBUG\": \"true\"})
 - force_sync (boolean, default: false): Force synchronous execution regardless of duration
 - custom_denylist (array, default: []): Additional dangerous patterns to block
@@ -168,7 +176,7 @@ RETURNS:
 - working_directory: Resolved working directory path
 - exit_code: Exit code (if completed, null if still running)
 - success: Boolean indicating success (if completed)
-- output: Command output (truncated to output_limit for preview)
+- output: Command output preview (truncated to preview_tokens by default)
 - truncated: Boolean indicating if output was truncated
 - timed_out: Boolean indicating if command was killed by timeout
 - switched_to_async: Boolean indicating if command moved to background
@@ -268,11 +276,12 @@ PARAMETERS:
 - job_id (string, required): The job identifier returned by enhanced_terminal
 - incremental (boolean, default: true): If true, return only new output since last check (RECOMMENDED)
 - offset (number, default: 0): Starting byte position for pagination
-- limit (number, default: 0): Maximum bytes to return (0 = all)
+- limit (number, default: 0): Maximum bytes to select for pagination (0 = all)
+- preview_tokens (number, default: 4096): Maximum GPT-5/o200k_base tokens to return from the selected output chunk; set 0 to disable token truncation
 
 BEHAVIOR:
 - Returns current status: Running, Completed, Failed, TimedOut, or Canceled
-- Full output available (up to output_limit)
+- Full output is available through pagination; preview_tokens can bound the returned text for model context
 - Incremental mode tracks read position per job
 - Duration calculated from start time
 - Exit code available when completed
@@ -291,7 +300,7 @@ PAGINATION MODE:
 When offset > 0 or limit > 0:
 - Returns specific byte range of output
 - offset: Starting position in bytes
-- limit: Number of bytes to return (0 = all remaining)
+- limit: Number of bytes to select before optional token previewing (0 = all remaining)
 - Returns has_more flag indicating if more data available
 - Returns total_length for overall output size
 - Useful for seeking into very long logs
@@ -308,7 +317,7 @@ RETURNS:
 - pid: Process ID (if available)
 - duration: Time elapsed since job start
 - tags: Optional tags assigned to job
-- output: Command output (full, incremental, or paginated based on parameters)
+- output: Command output (full, incremental, or paginated based on parameters, optionally token-previewed)
 - truncated: Boolean indicating if output preview was truncated
 - (pagination only) has_more: Boolean indicating if more data available
 - (pagination only) total_length: Total output size in bytes"
@@ -320,7 +329,7 @@ RETURNS:
         // Determine if pagination is requested
         let use_pagination = input.offset > 0 || input.limit > 0;
 
-        let (output_to_show, has_more, total_length) = if use_pagination {
+        let (mut output_to_show, has_more, total_length) = if use_pagination {
             // Use pagination
             let limit = if input.limit == 0 {
                 usize::MAX
@@ -389,6 +398,14 @@ RETURNS:
             result_text.push_str(&format!("PID: {}\n", pid));
         }
 
+        let token_preview = if input.preview_tokens > 0 {
+            let preview = preview_output(&output_to_show, input.preview_tokens);
+            output_to_show = preview.text.clone();
+            Some(preview)
+        } else {
+            None
+        };
+
         if use_pagination {
             result_text.push_str(&format!(
                 "Output Mode: Paginated (offset: {}, limit: {})\n",
@@ -411,6 +428,18 @@ RETURNS:
             ));
         } else {
             result_text.push_str(&format!("Output Mode: Full\n"));
+        }
+
+        if let Some(ref preview) = token_preview {
+            result_text.push_str(&format!(
+                "Preview Tokens: {} / {} ({})\n",
+                preview.tokens.unwrap_or(0),
+                preview.token_limit.unwrap_or(0),
+                preview.tokenizer.unwrap_or("unknown")
+            ));
+            if preview.truncated {
+                result_text.push_str("Token Preview Truncated: true\n");
+            }
         }
 
         result_text.push_str("\nOutput:\n");

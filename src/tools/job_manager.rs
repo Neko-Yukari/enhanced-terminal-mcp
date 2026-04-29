@@ -63,6 +63,14 @@ pub struct JobManager {
     job_counter: Arc<Mutex<u64>>,
 }
 
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while index > 0 && !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
+
 impl JobManager {
     pub fn new() -> Self {
         Self {
@@ -102,8 +110,8 @@ impl JobManager {
         pid: Option<u32>,
         tags: Vec<String>,
     ) {
-        let summary = if command.len() > 100 {
-            format!("{}...", &command[..97])
+        let summary = if command.chars().count() > 100 {
+            format!("{}...", command.chars().take(97).collect::<String>())
         } else {
             command.clone()
         };
@@ -142,7 +150,8 @@ impl JobManager {
             } else {
                 let remaining = output_limit.saturating_sub(job.output.len());
                 if remaining > 0 {
-                    job.output.push_str(&output[..remaining.min(output.len())]);
+                    let end = floor_char_boundary(output, remaining.min(output.len()));
+                    job.output.push_str(&output[..end]);
                 }
                 job.truncated = true;
             }
@@ -263,13 +272,15 @@ impl JobManager {
         let jobs = self.jobs.lock().unwrap();
         if let Some(job) = jobs.get(job_id) {
             let total_len = job.full_output.len();
-            let end = (offset + limit).min(total_len);
-            let output_slice = if offset < total_len {
-                job.full_output[offset..end].to_string()
+            let requested_end = offset.saturating_add(limit).min(total_len);
+            let start = floor_char_boundary(&job.full_output, offset);
+            let end = floor_char_boundary(&job.full_output, requested_end);
+            let output_slice = if start < total_len && start <= end {
+                job.full_output[start..end].to_string()
             } else {
                 String::new()
             };
-            let has_more = end < total_len;
+            let has_more = requested_end < total_len;
             Some((output_slice, has_more, total_len))
         } else {
             None

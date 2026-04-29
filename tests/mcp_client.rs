@@ -101,6 +101,43 @@ async fn enhanced_terminal_echo() {
     assert!(text.contains("hello"), "unexpected output: {text}");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enhanced_terminal_preview_tokens_truncates_output() {
+    let client = connect_child_client().await;
+
+    let res = client
+        .peer()
+        .call_tool(CallToolRequestParam {
+            name: Cow::Borrowed("enhanced_terminal"),
+            arguments: Some(
+                serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+                    "command": "printf 'alpha beta gamma delta'",
+                    "cwd": ".",
+                    "shell": "bash",
+                    "force_sync": true,
+                    "preview_tokens": 2
+                }))
+                .expect("tool arguments must be a JSON object")
+                .into_iter()
+                .collect(),
+            ),
+        })
+        .await
+        .expect("tools/call enhanced_terminal failed");
+
+    let text = text_from_calltool(res);
+    assert!(text.contains("alpha beta"), "unexpected output: {text}");
+    let output_section = text.split("Output:\n").nth(1).unwrap_or("");
+    assert!(
+        !output_section.contains("gamma"),
+        "preview was not token-truncated: {text}"
+    );
+    assert!(
+        text.contains("Output truncated"),
+        "missing truncation notice: {text}"
+    );
+}
+
 /// This test is opt-in because it may pop a GUI askpass prompt and requires a working desktop session.
 ///
 /// Enable by setting:

@@ -12,6 +12,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+use tiktoken_rs::o200k_base_singleton;
 use tokio::sync::{Mutex as TokioMutex, mpsc};
 
 use super::denylist::{find_matched_pattern, is_denied};
@@ -28,9 +29,10 @@ pub struct TerminalExecutionInput {
     /// Shell to use (default: "sh")
     #[serde(default = "default_shell")]
     pub shell: String,
-    /// Output limit in bytes (default: 16384)
-    #[serde(default = "default_output_limit")]
-    pub output_limit: usize,
+    /// Maximum number of GPT-5/o200k_base tokens to return in command output previews.
+    /// Set to 0 to disable token truncation for the bounded in-memory preview buffer.
+    #[serde(default = "default_preview_tokens")]
+    pub preview_tokens: usize,
     /// Environment variables to set for the command
     #[serde(default)]
     pub env_vars: std::collections::HashMap<String, String>,
@@ -53,9 +55,11 @@ fn default_shell() -> String {
     "bash".to_string()
 }
 
-fn default_output_limit() -> usize {
-    16 * 1024
+fn default_preview_tokens() -> usize {
+    4096
 }
+
+const MIN_PREVIEW_CAPTURE_BYTES: usize = 64 * 1024;
 
 fn apply_default_env(mut env_vars: HashMap<String, String>) -> HashMap<String, String> {
     env_vars
@@ -90,6 +94,81 @@ fn get_timeout_secs() -> Option<u64> {
     std::env::var("ENHANCED_TERMINAL_TIMEOUT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
+}
+
+#[derive(Debug, Clone)]
+pub struct PreviewedOutput {
+    pub text: String,
+    pub truncated: bool,
+    pub tokens: Option<usize>,
+    pub token_limit: Option<usize>,
+    pub tokenizer: Option<&'static str>,
+}
+
+pub fn preview_output(text: &str, preview_tokens: usize) -> PreviewedOutput {
+    if preview_tokens > 0 {
+        let bpe = o200k_base_singleton();
+        let tokens = bpe.encode_ordinary(text);
+        let token_count = tokens.len();
+
+        if token_count <= preview_tokens {
+            return PreviewedOutput {
+                text: text.to_string(),
+                truncated: false,
+                tokens: Some(token_count),
+                token_limit: Some(preview_tokens),
+                tokenizer: Some("o200k_base"),
+            };
+        }
+
+        let preview = bpe
+            .decode(&tokens[..preview_tokens])
+            .unwrap_or_else(|_| text.chars().take(preview_tokens).collect());
+
+        return PreviewedOutput {
+            text: preview,
+            truncated: true,
+            tokens: Some(token_count),
+            token_limit: Some(preview_tokens),
+            tokenizer: Some("o200k_base"),
+        };
+    }
+
+    PreviewedOutput {
+        text: text.to_string(),
+        truncated: false,
+        tokens: None,
+        token_limit: None,
+        tokenizer: None,
+    }
+}
+
+fn preview_buffer_limit(input: &TerminalExecutionInput) -> usize {
+    if input.preview_tokens > 0 {
+        MIN_PREVIEW_CAPTURE_BYTES.max(
+            input
+                .preview_tokens
+                .saturating_mul(16)
+                .saturating_add(8 * 1024),
+        )
+    } else {
+        MIN_PREVIEW_CAPTURE_BYTES
+    }
+}
+
+fn append_to_preview_buffer(buffer: &mut Vec<u8>, data: &[u8], limit: usize) -> bool {
+    if buffer.len() >= limit {
+        return !data.is_empty();
+    }
+
+    let remaining = limit.saturating_sub(buffer.len());
+    if data.len() <= remaining {
+        buffer.extend_from_slice(data);
+        false
+    } else {
+        buffer.extend_from_slice(&data[..remaining]);
+        true
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -223,7 +302,7 @@ pub async fn execute_command(
         .try_clone_reader()
         .map_err(|e| anyhow::anyhow!("Failed to clone reader: {}", e))?;
 
-    let output_limit = input.output_limit;
+    let preview_byte_limit = preview_buffer_limit(input);
     let timeout = get_timeout_secs().map(Duration::from_secs);
     let async_threshold = Duration::from_secs(get_async_threshold_secs());
     let start_time = Instant::now();
@@ -302,17 +381,11 @@ pub async fn execute_command(
         // Try to receive output from reader task with timeout
         match tokio::time::timeout(check_interval, rx.recv()).await {
             Ok(Some(ReadMsg::Data(data))) => {
-                if output.len() + data.len() <= output_limit {
-                    output.extend_from_slice(&data);
-                } else {
-                    let remaining = output_limit.saturating_sub(output.len());
-                    output.extend_from_slice(&data[..remaining]);
-                    truncated = true;
-                }
+                truncated |= append_to_preview_buffer(&mut output, &data, preview_byte_limit);
 
                 // Update job with incremental output
                 let output_str = String::from_utf8_lossy(&data).to_string();
-                job_manager.append_output(&job_id, &output_str, output_limit);
+                job_manager.append_output(&job_id, &output_str, preview_byte_limit);
 
                 // Send streaming notification if peer is available
                 if let Some(ref peer) = peer {
@@ -382,7 +455,11 @@ pub async fn execute_command(
                 match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
                     Ok(Some(ReadMsg::Data(data))) => {
                         let output_str = String::from_utf8_lossy(&data).to_string();
-                        job_manager_clone.append_output(&job_id_clone, &output_str, output_limit);
+                        job_manager_clone.append_output(
+                            &job_id_clone,
+                            &output_str,
+                            preview_byte_limit,
+                        );
                     }
                     Ok(Some(ReadMsg::Eof)) => {
                         // Process finished
@@ -420,8 +497,11 @@ pub async fn execute_command(
             }
         });
 
-        // Return immediately with current output and duration so far
-        let output_str = String::from_utf8_lossy(&output).to_string();
+        // Return immediately with a bounded preview and duration so far.
+        let raw_output_str = String::from_utf8_lossy(&output).to_string();
+        let preview = preview_output(&raw_output_str, input.preview_tokens);
+        let output_str = preview.text;
+        truncated |= preview.truncated;
         let duration_secs = start_time.elapsed().as_secs_f64();
         tracing::info!(
             "Returning async result: job_id={}, duration={:.2}s",
@@ -454,7 +534,10 @@ pub async fn execute_command(
     let exit_code = exit_status.map(|s| s.exit_code() as i32);
     let success = exit_code.map(|c| c == 0).unwrap_or(false);
 
-    let mut output_str = String::from_utf8_lossy(&output).to_string();
+    let raw_output_str = String::from_utf8_lossy(&output).to_string();
+    let preview = preview_output(&raw_output_str, input.preview_tokens);
+    let mut output_str = preview.text;
+    truncated |= preview.truncated;
 
     // Complete job
     let status = if timed_out {
@@ -628,7 +711,7 @@ async fn execute_command_inner(
         .try_clone_reader()
         .map_err(|e| anyhow::anyhow!("Failed to clone reader: {}", e))?;
 
-    let output_limit = input.output_limit;
+    let preview_byte_limit = preview_buffer_limit(input);
     let timeout = get_timeout_secs().map(Duration::from_secs);
     let async_threshold = Duration::from_secs(get_async_threshold_secs());
     let start_time = Instant::now();
@@ -707,17 +790,11 @@ async fn execute_command_inner(
         // Try to receive output from reader task with timeout
         match tokio::time::timeout(check_interval, rx.recv()).await {
             Ok(Some(ReadMsg::Data(data))) => {
-                if output.len() + data.len() <= output_limit {
-                    output.extend_from_slice(&data);
-                } else {
-                    let remaining = output_limit.saturating_sub(output.len());
-                    output.extend_from_slice(&data[..remaining]);
-                    truncated = true;
-                }
+                truncated |= append_to_preview_buffer(&mut output, &data, preview_byte_limit);
 
                 // Update job with incremental output
                 let output_str = String::from_utf8_lossy(&data).to_string();
-                job_manager.append_output(&job_id, &output_str, output_limit);
+                job_manager.append_output(&job_id, &output_str, preview_byte_limit);
 
                 // Send streaming notification if peer is available
                 if let Some(ref peer) = peer {
@@ -787,7 +864,11 @@ async fn execute_command_inner(
                 match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
                     Ok(Some(ReadMsg::Data(data))) => {
                         let output_str = String::from_utf8_lossy(&data).to_string();
-                        job_manager_clone.append_output(&job_id_clone, &output_str, output_limit);
+                        job_manager_clone.append_output(
+                            &job_id_clone,
+                            &output_str,
+                            preview_byte_limit,
+                        );
                     }
                     Ok(Some(ReadMsg::Eof)) => {
                         // Process finished
@@ -825,8 +906,11 @@ async fn execute_command_inner(
             }
         });
 
-        // Return immediately with current output and duration so far
-        let mut output_str = String::from_utf8_lossy(&output).to_string();
+        // Return immediately with a bounded preview and duration so far.
+        let raw_output_str = String::from_utf8_lossy(&output).to_string();
+        let preview = preview_output(&raw_output_str, input.preview_tokens);
+        let mut output_str = preview.text;
+        truncated |= preview.truncated;
         let duration_secs = start_time.elapsed().as_secs_f64();
 
         if sudo_looks_used(command) {
@@ -892,7 +976,10 @@ async fn execute_command_inner(
     let exit_code = exit_status.map(|s| s.exit_code() as i32);
     let success = exit_code.map(|c| c == 0).unwrap_or(false);
 
-    let mut output_str = String::from_utf8_lossy(&output).to_string();
+    let raw_output_str = String::from_utf8_lossy(&output).to_string();
+    let preview = preview_output(&raw_output_str, input.preview_tokens);
+    let mut output_str = preview.text;
+    truncated |= preview.truncated;
 
     // Complete job
     let status = if timed_out {

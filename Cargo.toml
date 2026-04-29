@@ -13,6 +13,7 @@ anyhow = "1"
 portable-pty = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tiktoken-rs = "0.11"
 
 [dev-dependencies]
 rmcp = { version = "0.8", features = ["client", "transport-async-rw"] }

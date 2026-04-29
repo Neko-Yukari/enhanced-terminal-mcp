@@ -225,6 +225,16 @@ With tags for job categorization:
 }
 ```
 
+Token-bounded preview (GPT-5/o200k_base tokenizer):
+```json
+{
+  "command": "cargo test",
+  "preview_tokens": 4000
+}
+```
+
+`preview_tokens` defaults to 4096. Set it to 0 to disable token truncation for the bounded in-memory preview buffer.
+
 #### enhanced_terminal_job_status
 
 Get full output:
