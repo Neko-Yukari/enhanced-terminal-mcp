@@ -1,6 +1,6 @@
 # Enhanced Terminal MCP Server
 
-A standalone Model Context Protocol (MCP) server that provides terminal execution, binary detection, and shell detection capabilities. This server extracts and reimplements key tools from the Zed editor project.
+A standalone Model Context Protocol (MCP) server that provides terminal execution, binary detection, and shell detection capabilities.
 
 ## Features
 
@@ -160,7 +160,7 @@ The server uses stdio transport for MCP communication:
 
 ### Configuration
 
-Add to your MCP client configuration (e.g., Claude Desktop, Zed):
+Add to your MCP client configuration:
 
 ```json
 {
@@ -175,7 +175,7 @@ Add to your MCP client configuration (e.g., Claude Desktop, Zed):
 
 ### Call Logging
 
-Every `enhanced_terminal` tool call is appended as one JSON object per line to `enhanced_terminal_calls.jsonl` in the repository root. Each entry includes an RFC3339 UTC `datetime`, the tool name, and the full submitted parameters. Writes are serialized with an in-process mutex and, on Unix, an exclusive file lock so concurrent tool calls and test server processes do not interleave JSON records.
+Every `enhanced_terminal` tool call is appended as one JSON object per line to `enhanced_terminal_calls.jsonl` in the repository root. Each entry includes an RFC3339 UTC `datetime`, the tool name, and the full submitted parameters. Writes use an in-process mutex and, on Unix, an exclusive file lock so concurrent tool calls and test server processes do not interleave JSON records.
 
 Override the log path with `ENHANCED_TERMINAL_CALL_LOG_PATH` if needed.
 
@@ -383,7 +383,7 @@ The `detect_binaries` tool supports filtering by these categories:
 - `maven_tools` - mvn, mvnw, mvnd
 - `node_js_tools` - node, deno, bun, npm, yarn, pnpm, tsx, tsc, biome, prettier, eslint
 - `go_tools` - go, gofmt
-- `editors_dev` - vim, nvim, emacs, code, zed, hx, nano, micro
+- `editors_dev` - vim, nvim, emacs, code, hx, nano, micro
 - `search_productivity` - rg, fd, fzf, jq, bat, tree, exa, sd, zoxide, lsd, dust, btm, broot, choose
 - `system_perf` - htop, ps, top, df, du
 - `containers` - docker, podman, kubectl, helm, docker-compose, kind, minikube, skopeo, buildah, nerdctl, k9s
@@ -574,7 +574,3 @@ This server uses a modular structure with Rust 2024 edition:
 ## License
 
 MIT License - see [LICENSE](LICENSE) file for details
-
-## Credits
-
-Tools extracted and adapted from the [Zed editor](https://github.com/zed-industries/zed) project.
