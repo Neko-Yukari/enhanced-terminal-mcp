@@ -56,7 +56,10 @@ fn default_cwd() -> String {
 }
 
 fn default_shell() -> String {
-    "bash".to_string()
+    #[cfg(windows)]
+    return "cmd".to_string();
+    #[cfg(not(windows))]
+    return "bash".to_string();
 }
 
 fn default_preview_tokens() -> usize {
@@ -271,6 +274,13 @@ pub async fn execute_command(
 
     // Build command
     let mut cmd = CommandBuilder::new(&input.shell);
+    #[cfg(windows)]
+    if input.shell == "cmd" {
+        cmd.arg("/C");
+    } else {
+        cmd.arg("-c");
+    }
+    #[cfg(not(windows))]
     cmd.arg("-c");
     cmd.arg(command);
     cmd.cwd(&cwd);
@@ -689,6 +699,13 @@ async fn execute_command_inner(
 
     // Build command
     let mut cmd = CommandBuilder::new(&input.shell);
+    #[cfg(windows)]
+    if input.shell == "cmd" {
+        cmd.arg("/C");
+    } else {
+        cmd.arg("-c");
+    }
+    #[cfg(not(windows))]
     cmd.arg("-c");
     cmd.arg(command);
     cmd.cwd(&cwd);
