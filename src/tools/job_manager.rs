@@ -264,9 +264,18 @@ impl JobManager {
                 .ok_or_else(|| anyhow::anyhow!("Job stdin is not available"))?
         };
 
-        let bytes = input.as_bytes();
+        let bytes = {
+            // On Windows ConPTY (WIN32_INPUT_MODE) a lone \n does not submit a
+            // line in Read-Host/ReadConsole — a \r is required. Normalize so callers
+            // can send plain \n like on POSIX terminals.
+            #[cfg(windows)]
+            let input = input.replace("\r\n", "\n").replace('\n', "\r\n");
+            #[cfg(not(windows))]
+            let input = input.to_string();
+            input.into_bytes()
+        };
         let mut writer = writer.lock().unwrap();
-        writer.write_all(bytes)?;
+        writer.write_all(&bytes)?;
         writer.flush()?;
         Ok(bytes.len())
     }

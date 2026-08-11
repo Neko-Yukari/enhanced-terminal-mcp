@@ -448,8 +448,14 @@ pub async fn execute_command(
         let job_id_clone = job_id.clone();
         let timeout_remaining = timeout.map(|t| t.saturating_sub(start_time.elapsed()));
         let child_arc = Arc::new(tokio::sync::Mutex::new(child));
+        // FIX(Windows): keep the ConPTY master alive inside the background task.
+        // Dropping pair.master closes the pseudo console (ClosePseudoConsole), which
+        // kills the child process and breaks the stdin pipe (BrokenPipe) — the process
+        // would die right after switching to async, so job_stdin always failed.
+        let pair_master = pair.master;
 
         tokio::spawn(async move {
+            let _keep_master_alive = pair_master;
             tracing::debug!("Background task started for job_id={}", job_id_clone);
             let start_bg = Instant::now();
 
@@ -866,8 +872,14 @@ async fn execute_command_inner(
         let job_id_clone = job_id.clone();
         let timeout_remaining = timeout.map(|t| t.saturating_sub(start_time.elapsed()));
         let child_arc = Arc::new(tokio::sync::Mutex::new(child));
+        // FIX(Windows): keep the ConPTY master alive inside the background task.
+        // Dropping pair.master closes the pseudo console (ClosePseudoConsole), which
+        // kills the child process and breaks the stdin pipe (BrokenPipe) — the process
+        // would die right after switching to async, so job_stdin always failed.
+        let pair_master = pair.master;
 
         tokio::spawn(async move {
+            let _keep_master_alive = pair_master;
             tracing::debug!("Background task started for job_id={}", job_id_clone);
             let start_bg = Instant::now();
 
