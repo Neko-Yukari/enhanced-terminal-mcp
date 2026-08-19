@@ -1,5 +1,5 @@
 use crate::detection::{detect_binaries, detect_shells};
-use crate::tools::{JobManager, TerminalExecutionInput, execute_command, preview_output};
+use crate::tools::{JobManager, TerminalExecutionInput, default_shell, execute_command, preview_output};
 use chrono::{SecondsFormat, Utc};
 use rmcp::{
     ErrorData as McpError, Peer, handler::server::router::tool::ToolRouter,
@@ -882,7 +882,7 @@ impl rmcp::ServerHandler for EnhancedTerminalServer {
             TOOLS:\n\
             \n\
             1. enhanced_terminal - Execute shell commands\n\
-               • Default shell: bash\n\
+               • Default shell: {}\n\
                • Available shells: {}\n\
                • Smart async: Auto-background after 50s (ENHANCED_TERMINAL_ASYNC_THRESHOLD_SECS env var)\n\
                • Force async: Set force_async=true to immediately get a job_id for stdin-capable interactive jobs\n\
@@ -974,7 +974,7 @@ impl rmcp::ServerHandler for EnhancedTerminalServer {
             {{\"filter_categories\": [\"python_tools\"], \"max_concurrency\": 16}}\n\
             \n\
             Extracted and adapted from the Zed editor project.",
-            self.shell_info, self.shell_info
+            default_shell(), self.shell_info, self.shell_info
         );
 
         ServerInfo {

@@ -55,9 +55,9 @@ fn default_cwd() -> String {
     ".".to_string()
 }
 
-fn default_shell() -> String {
+pub fn default_shell() -> String {
     #[cfg(windows)]
-    return "cmd".to_string();
+    return "pwsh".to_string();
     #[cfg(not(windows))]
     return "bash".to_string();
 }
@@ -251,15 +251,25 @@ pub async fn execute_command(
         });
     }
 
-    // Resolve working directory and canonicalize (resolve symlinks)
+    // Resolve working directory
     let cwd = if input.cwd == "." || input.cwd.is_empty() {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     } else {
         PathBuf::from(&input.cwd)
     };
 
-    // Canonicalize to resolve symlinks
-    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    // Canonicalize to resolve symlinks, but on Windows avoid UNC paths
+    // which can cause CMD.EXE to fail with STATUS_DLL_INIT_FAILED
+    let cwd = cwd.canonicalize().unwrap_or(cwd.clone());
+    #[cfg(windows)]
+    let cwd = {
+        let path_str = cwd.to_string_lossy();
+        if path_str.starts_with(r"\\?\") {
+            PathBuf::from(&path_str[4..])
+        } else {
+            cwd
+        }
+    };
 
     // Create PTY system
     let pty_system = native_pty_system();
@@ -277,19 +287,17 @@ pub async fn execute_command(
     #[cfg(windows)]
     if input.shell == "cmd" {
         cmd.arg("/C");
-        cmd.arg(command);
+    } else if input.shell == "pwsh" || input.shell == "powershell" {
+        // Skip profile loading (NoLogo/NoProfile) for faster startup
+        cmd.arg("-NoLogo");
+        cmd.arg("-NoProfile");
+        cmd.arg("-Command");
     } else {
         cmd.arg("-c");
-        // PowerShell keeps running when its stdin is a PTY even after -Command
-        // finishes; append an explicit exit so the process terminates and sync
-        // calls complete instead of timing out.
-        cmd.arg(format!("{command}\n exit"));
     }
     #[cfg(not(windows))]
-    {
-        cmd.arg("-c");
-        cmd.arg(command);
-    }
+    cmd.arg("-c");
+    cmd.arg(command);
     cmd.cwd(&cwd);
 
     // Set environment variables
@@ -381,6 +389,7 @@ pub async fn execute_command(
 
     // Main loop: check elapsed time independently and receive output
     let check_interval = Duration::from_millis(100);
+    let mut no_output_ticks = 0;
     loop {
         let elapsed = start_time.elapsed();
 
@@ -446,12 +455,24 @@ pub async fn execute_command(
                 break;
             }
             Err(_) => {
-                // Timeout waiting for data - this is normal, continue loop to check elapsed time.
-                // On Windows, ConPTY withholds EOF while the master write handle stays open even
-                // after the child exits; poll the child so a finished process is not mistaken
-                // for a running one (which would hang synchronous calls).
-                if let Ok(Some(_)) = child.try_wait() {
-                    tracing::debug!("Main task: child process exited, job_id={}", job_id);
+                // Timeout waiting for data
+                no_output_ticks += 1;
+                // WINDOWS FIX: PTY EOF is unreliable; poll child process directly
+                if let Ok(Some(_status)) = child.try_wait() {
+                    tracing::debug!(
+                        "Main task: child exited without PTY EOF, breaking job_id={}",
+                        job_id
+                    );
+                    break;
+                }
+                // If no output for 3 seconds (30 ticks) and output buffer is empty,
+                // the process likely crashed immediately (e.g., DLL init failure on Windows)
+                if output.is_empty() && no_output_ticks > 30 {
+                    tracing::warn!(
+                        "Main task: no output for 3s, process likely crashed, killing job_id={}",
+                        job_id
+                    );
+                    let _ = child.kill();
                     break;
                 }
                 continue;
@@ -472,14 +493,8 @@ pub async fn execute_command(
         let job_id_clone = job_id.clone();
         let timeout_remaining = timeout.map(|t| t.saturating_sub(start_time.elapsed()));
         let child_arc = Arc::new(tokio::sync::Mutex::new(child));
-        // FIX(Windows): keep the ConPTY master alive inside the background task.
-        // Dropping pair.master closes the pseudo console (ClosePseudoConsole), which
-        // kills the child process and breaks the stdin pipe (BrokenPipe) — the process
-        // would die right after switching to async, so job_stdin always failed.
-        let pair_master = pair.master;
 
         tokio::spawn(async move {
-            let _keep_master_alive = pair_master;
             tracing::debug!("Background task started for job_id={}", job_id_clone);
             let start_bg = Instant::now();
 
@@ -534,29 +549,31 @@ pub async fn execute_command(
                         break;
                     }
                     Err(_) => {
-                        // Timeout waiting for data - poll the child for exit.
-                        // On Windows, ConPTY withholds EOF while the master write handle stays
-                        // open even after the child exits, so a finished process must still
-                        // complete its job through child polling.
-                        let mut child_guard = child_arc.lock().await;
-                        if let Ok(Some(_)) = child_guard.try_wait() {
-                            let exit_status = child_guard.wait().ok();
-                            let exit_code = exit_status.map(|s| s.exit_code() as i32);
-                            let bg_status = if exit_code == Some(0) {
-                                JobStatus::Completed
-                            } else {
-                                JobStatus::Failed
-                            };
-                            tracing::debug!(
-                                "Background job child exited: job_id={}, exit_code={:?}",
-                                job_id_clone,
-                                exit_code
-                            );
-                            drop(child_guard);
-                            job_manager_clone.complete_job(&job_id_clone, exit_code, bg_status);
-                            break;
+                        // WINDOWS FIX: PTY EOF is unreliable; poll child process directly
+                        {
+                            let mut child_guard = child_arc.lock().await;
+                            if let Ok(Some(status)) = child_guard.try_wait() {
+                                let exit_code = status.exit_code() as i32;
+                                let job_status = if exit_code == 0 {
+                                    JobStatus::Completed
+                                } else {
+                                    JobStatus::Failed
+                                };
+                                drop(child_guard);
+                                tracing::debug!(
+                                    "Background task: child exited without PTY EOF, job_id={}, exit_code={}",
+                                    job_id_clone,
+                                    exit_code
+                                );
+                                job_manager_clone.complete_job(
+                                    &job_id_clone,
+                                    Some(exit_code),
+                                    job_status,
+                                );
+                                break;
+                            }
                         }
-                        drop(child_guard);
+                        // Timeout waiting for data, continue loop to check timeout
                         continue;
                     }
                 }
@@ -718,15 +735,25 @@ async fn execute_command_inner(
         });
     }
 
-    // Resolve working directory and canonicalize (resolve symlinks)
+    // Resolve working directory
     let cwd = if input.cwd == "." || input.cwd.is_empty() {
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     } else {
         PathBuf::from(&input.cwd)
     };
 
-    // Canonicalize to resolve symlinks
-    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    // Canonicalize to resolve symlinks, but on Windows avoid UNC paths
+    // which can cause CMD.EXE to fail with STATUS_DLL_INIT_FAILED
+    let cwd = cwd.canonicalize().unwrap_or(cwd.clone());
+    #[cfg(windows)]
+    let cwd = {
+        let path_str = cwd.to_string_lossy();
+        if path_str.starts_with(r"\\?\") {
+            PathBuf::from(&path_str[4..])
+        } else {
+            cwd
+        }
+    };
 
     // Create PTY system
     let pty_system = native_pty_system();
@@ -744,19 +771,17 @@ async fn execute_command_inner(
     #[cfg(windows)]
     if input.shell == "cmd" {
         cmd.arg("/C");
-        cmd.arg(command);
+    } else if input.shell == "pwsh" || input.shell == "powershell" {
+        // Skip profile loading (NoLogo/NoProfile) for faster startup
+        cmd.arg("-NoLogo");
+        cmd.arg("-NoProfile");
+        cmd.arg("-Command");
     } else {
         cmd.arg("-c");
-        // PowerShell keeps running when its stdin is a PTY even after -Command
-        // finishes; append an explicit exit so the process terminates and sync
-        // calls complete instead of timing out.
-        cmd.arg(format!("{command}\n exit"));
     }
     #[cfg(not(windows))]
-    {
-        cmd.arg("-c");
-        cmd.arg(command);
-    }
+    cmd.arg("-c");
+    cmd.arg(command);
     cmd.cwd(&cwd);
 
     // Set environment variables
@@ -848,6 +873,7 @@ async fn execute_command_inner(
 
     // Main loop: check elapsed time independently and receive output
     let check_interval = Duration::from_millis(100);
+    let mut no_output_ticks = 0;
     loop {
         let elapsed = start_time.elapsed();
 
@@ -913,12 +939,24 @@ async fn execute_command_inner(
                 break;
             }
             Err(_) => {
-                // Timeout waiting for data - this is normal, continue loop to check elapsed time.
-                // On Windows, ConPTY withholds EOF while the master write handle stays open even
-                // after the child exits; poll the child so a finished process is not mistaken
-                // for a running one (which would hang synchronous calls).
-                if let Ok(Some(_)) = child.try_wait() {
-                    tracing::debug!("Main task: child process exited, job_id={}", job_id);
+                // Timeout waiting for data
+                no_output_ticks += 1;
+                // WINDOWS FIX: PTY EOF is unreliable; poll child process directly
+                if let Ok(Some(_status)) = child.try_wait() {
+                    tracing::debug!(
+                        "Main task: child exited without PTY EOF, breaking job_id={}",
+                        job_id
+                    );
+                    break;
+                }
+                // If no output for 3 seconds (30 ticks) and output buffer is empty,
+                // the process likely crashed immediately (e.g., DLL init failure on Windows)
+                if output.is_empty() && no_output_ticks > 30 {
+                    tracing::warn!(
+                        "Main task: no output for 3s, process likely crashed, killing job_id={}",
+                        job_id
+                    );
+                    let _ = child.kill();
                     break;
                 }
                 continue;
@@ -939,14 +977,8 @@ async fn execute_command_inner(
         let job_id_clone = job_id.clone();
         let timeout_remaining = timeout.map(|t| t.saturating_sub(start_time.elapsed()));
         let child_arc = Arc::new(tokio::sync::Mutex::new(child));
-        // FIX(Windows): keep the ConPTY master alive inside the background task.
-        // Dropping pair.master closes the pseudo console (ClosePseudoConsole), which
-        // kills the child process and breaks the stdin pipe (BrokenPipe) — the process
-        // would die right after switching to async, so job_stdin always failed.
-        let pair_master = pair.master;
 
         tokio::spawn(async move {
-            let _keep_master_alive = pair_master;
             tracing::debug!("Background task started for job_id={}", job_id_clone);
             let start_bg = Instant::now();
 
@@ -1001,29 +1033,31 @@ async fn execute_command_inner(
                         break;
                     }
                     Err(_) => {
-                        // Timeout waiting for data - poll the child for exit.
-                        // On Windows, ConPTY withholds EOF while the master write handle stays
-                        // open even after the child exits, so a finished process must still
-                        // complete its job through child polling.
-                        let mut child_guard = child_arc.lock().await;
-                        if let Ok(Some(_)) = child_guard.try_wait() {
-                            let exit_status = child_guard.wait().ok();
-                            let exit_code = exit_status.map(|s| s.exit_code() as i32);
-                            let bg_status = if exit_code == Some(0) {
-                                JobStatus::Completed
-                            } else {
-                                JobStatus::Failed
-                            };
-                            tracing::debug!(
-                                "Background job child exited: job_id={}, exit_code={:?}",
-                                job_id_clone,
-                                exit_code
-                            );
-                            drop(child_guard);
-                            job_manager_clone.complete_job(&job_id_clone, exit_code, bg_status);
-                            break;
+                        // WINDOWS FIX: PTY EOF is unreliable; poll child process directly
+                        {
+                            let mut child_guard = child_arc.lock().await;
+                            if let Ok(Some(status)) = child_guard.try_wait() {
+                                let exit_code = status.exit_code() as i32;
+                                let job_status = if exit_code == 0 {
+                                    JobStatus::Completed
+                                } else {
+                                    JobStatus::Failed
+                                };
+                                drop(child_guard);
+                                tracing::debug!(
+                                    "Background task: child exited without PTY EOF, job_id={}, exit_code={}",
+                                    job_id_clone,
+                                    exit_code
+                                );
+                                job_manager_clone.complete_job(
+                                    &job_id_clone,
+                                    Some(exit_code),
+                                    job_status,
+                                );
+                                break;
+                            }
                         }
-                        drop(child_guard);
+                        // Timeout waiting for data, continue loop to check timeout
                         continue;
                     }
                 }

@@ -241,7 +241,7 @@ const BASE_CANDIDATE_GROUPS: &[(&str, &[&str])] = &[
 const COMMON_SHELLS: &[(&str, &str)] = &[
     ("C:\\Windows\\System32\\cmd.exe", "cmd"),
     ("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "powershell"),
-    ("pwsh", "pwsh"),
+    ("C:\\Program Files\\PowerShell\\7\\pwsh.exe", "pwsh"),
 ];
 
 #[cfg(not(windows))]
