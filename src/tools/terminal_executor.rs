@@ -277,12 +277,19 @@ pub async fn execute_command(
     #[cfg(windows)]
     if input.shell == "cmd" {
         cmd.arg("/C");
+        cmd.arg(command);
     } else {
         cmd.arg("-c");
+        // PowerShell keeps running when its stdin is a PTY even after -Command
+        // finishes; append an explicit exit so the process terminates and sync
+        // calls complete instead of timing out.
+        cmd.arg(format!("{command}\n exit"));
     }
     #[cfg(not(windows))]
-    cmd.arg("-c");
-    cmd.arg(command);
+    {
+        cmd.arg("-c");
+        cmd.arg(command);
+    }
     cmd.cwd(&cwd);
 
     // Set environment variables
@@ -439,7 +446,14 @@ pub async fn execute_command(
                 break;
             }
             Err(_) => {
-                // Timeout waiting for data - this is normal, continue loop to check elapsed time
+                // Timeout waiting for data - this is normal, continue loop to check elapsed time.
+                // On Windows, ConPTY withholds EOF while the master write handle stays open even
+                // after the child exits; poll the child so a finished process is not mistaken
+                // for a running one (which would hang synchronous calls).
+                if let Ok(Some(_)) = child.try_wait() {
+                    tracing::debug!("Main task: child process exited, job_id={}", job_id);
+                    break;
+                }
                 continue;
             }
         }
@@ -520,7 +534,29 @@ pub async fn execute_command(
                         break;
                     }
                     Err(_) => {
-                        // Timeout waiting for data, continue loop to check timeout
+                        // Timeout waiting for data - poll the child for exit.
+                        // On Windows, ConPTY withholds EOF while the master write handle stays
+                        // open even after the child exits, so a finished process must still
+                        // complete its job through child polling.
+                        let mut child_guard = child_arc.lock().await;
+                        if let Ok(Some(_)) = child_guard.try_wait() {
+                            let exit_status = child_guard.wait().ok();
+                            let exit_code = exit_status.map(|s| s.exit_code() as i32);
+                            let bg_status = if exit_code == Some(0) {
+                                JobStatus::Completed
+                            } else {
+                                JobStatus::Failed
+                            };
+                            tracing::debug!(
+                                "Background job child exited: job_id={}, exit_code={:?}",
+                                job_id_clone,
+                                exit_code
+                            );
+                            drop(child_guard);
+                            job_manager_clone.complete_job(&job_id_clone, exit_code, bg_status);
+                            break;
+                        }
+                        drop(child_guard);
                         continue;
                     }
                 }
@@ -708,12 +744,19 @@ async fn execute_command_inner(
     #[cfg(windows)]
     if input.shell == "cmd" {
         cmd.arg("/C");
+        cmd.arg(command);
     } else {
         cmd.arg("-c");
+        // PowerShell keeps running when its stdin is a PTY even after -Command
+        // finishes; append an explicit exit so the process terminates and sync
+        // calls complete instead of timing out.
+        cmd.arg(format!("{command}\n exit"));
     }
     #[cfg(not(windows))]
-    cmd.arg("-c");
-    cmd.arg(command);
+    {
+        cmd.arg("-c");
+        cmd.arg(command);
+    }
     cmd.cwd(&cwd);
 
     // Set environment variables
@@ -870,7 +913,14 @@ async fn execute_command_inner(
                 break;
             }
             Err(_) => {
-                // Timeout waiting for data - this is normal, continue loop to check elapsed time
+                // Timeout waiting for data - this is normal, continue loop to check elapsed time.
+                // On Windows, ConPTY withholds EOF while the master write handle stays open even
+                // after the child exits; poll the child so a finished process is not mistaken
+                // for a running one (which would hang synchronous calls).
+                if let Ok(Some(_)) = child.try_wait() {
+                    tracing::debug!("Main task: child process exited, job_id={}", job_id);
+                    break;
+                }
                 continue;
             }
         }
@@ -951,7 +1001,29 @@ async fn execute_command_inner(
                         break;
                     }
                     Err(_) => {
-                        // Timeout waiting for data, continue loop to check timeout
+                        // Timeout waiting for data - poll the child for exit.
+                        // On Windows, ConPTY withholds EOF while the master write handle stays
+                        // open even after the child exits, so a finished process must still
+                        // complete its job through child polling.
+                        let mut child_guard = child_arc.lock().await;
+                        if let Ok(Some(_)) = child_guard.try_wait() {
+                            let exit_status = child_guard.wait().ok();
+                            let exit_code = exit_status.map(|s| s.exit_code() as i32);
+                            let bg_status = if exit_code == Some(0) {
+                                JobStatus::Completed
+                            } else {
+                                JobStatus::Failed
+                            };
+                            tracing::debug!(
+                                "Background job child exited: job_id={}, exit_code={:?}",
+                                job_id_clone,
+                                exit_code
+                            );
+                            drop(child_guard);
+                            job_manager_clone.complete_job(&job_id_clone, exit_code, bg_status);
+                            break;
+                        }
+                        drop(child_guard);
                         continue;
                     }
                 }
