@@ -375,14 +375,30 @@ pub fn detect_shells() -> Vec<ShellInfo> {
     let mut seen_names = std::collections::HashSet::new();
 
     for (path, name) in COMMON_SHELLS {
-        if Path::new(path).exists() && !seen_names.contains(*name) {
+        if seen_names.contains(*name) {
+            continue;
+        }
+
+        // Resolve shell path: absolute paths are checked directly, bare names
+        // (e.g. "pwsh") are resolved via PATH lookup. Windows executables carry a
+        // .exe extension, so probe both the bare name and the .exe variant.
+        let resolved = if Path::new(path).is_absolute() {
+            Path::new(path).exists().then(|| path.to_string())
+        } else {
+            which_all(path)
+                .into_iter()
+                .chain(which_all(&format!("{path}.exe")))
+                .next()
+        };
+
+        if let Some(shell_path) = resolved {
             seen_names.insert(name.to_string());
 
-            let version = detect_version(path, 1500).ok();
+            let version = detect_version(&shell_path, 1500).ok();
 
             shells.push(ShellInfo {
                 name: name.to_string(),
-                path: path.to_string(),
+                path: shell_path,
                 version,
             });
         }
