@@ -655,19 +655,37 @@ async fn job_status_uses_byte_explicit_pagination() {
         .expect("tools/call enhanced_terminal_job_status failed");
 
     let text = text_from_calltool(status);
-    assert!(
-        text.contains("Output Mode: Paginated (offset_bytes: 0, limit_bytes: 4)"),
-        "missing byte-explicit mode: {text}"
-    );
-    assert!(
-        text.contains("Returned Byte Range: 0..4 (requested end: 4)"),
-        "missing byte range metadata: {text}"
-    );
-    assert!(
-        text.contains("Next Offset Bytes: 4"),
-        "missing next byte offset: {text}"
-    );
-    assert!(text.contains("Output:\nabcd"), "unexpected output: {text}");
+    let (header, output) = text
+        .split_once("\nOutput:\n")
+        .expect("missing output separator");
+    assert!(header.lines().any(|line| line == "Output Mode: Explicit"));
+    let range = header
+        .lines()
+        .find_map(|line| line.strip_prefix("Returned Byte Range: "))
+        .expect("missing returned byte range");
+    let (start, end) = range.split_once("..").expect("invalid byte range");
+    assert_eq!((start.parse::<usize>().unwrap(), end.parse::<usize>().unwrap()), (0, 4));
+
+    let metadata: Value = serde_json::from_str(
+        header
+            .lines()
+            .find_map(|line| line.strip_prefix("Read Metadata: "))
+            .expect("missing read metadata"),
+    )
+    .expect("read metadata must be valid JSON");
+    assert_eq!(metadata["view"], "stored_utf8_raw_pty_transcript");
+    assert_eq!(metadata["byte_base"], 0);
+    assert_eq!(metadata["byte_end_exclusive"], true);
+    assert_eq!(metadata["line_base"], 1);
+    assert_eq!(metadata["selection_start_byte"], 0);
+    assert_eq!(metadata["selection_end_byte"], 4);
+    assert_eq!(metadata["selection_has_more"], false);
+    assert_eq!(metadata["partial_start"], false);
+    assert_eq!(metadata["partial_end"], true);
+    assert_eq!(metadata["continue"], Value::Null);
+    assert!(header.lines().any(|line| line == "Has More: true"));
+    assert!(header.lines().any(|line| line == "Next Offset Bytes: 4"));
+    assert_eq!(output, "abcd");
 }
 
 /// This test is opt-in because it may pop a GUI askpass prompt and requires a working desktop session.

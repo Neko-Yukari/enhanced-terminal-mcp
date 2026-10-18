@@ -6,7 +6,7 @@ A standalone Model Context Protocol (MCP) server that provides terminal executio
 
 ### Tools
 
-1. **enhanced_terminal** - Execute shell commands with smart async switching
+1. **enhanced_terminal** - Execute shell commands or native programs with smart async switching
    - **Streaming Output**: Real-time output notifications in sync mode
    - Automatically switches to background after 50 seconds (configurable)
    - PTY support with proper terminal emulation
@@ -24,9 +24,9 @@ A standalone Model Context Protocol (MCP) server that provides terminal executio
    - Filter and limit results
    - Quick overview of job statuses
 
-4. **enhanced_terminal_job_cancel** - Cancel running background jobs (Unix only)
-   - Send SIGTERM to running processes
-   - Graceful termination of long-running commands
+4. **enhanced_terminal_job_cancel** - Cancel running background jobs
+   - Windows: forcefully terminate the task-owned Windows Job Object and wait for its processes to exit
+   - Unix: send SIGTERM to the tracked process
 
 5. **enhanced_terminal_job_stdin** - Send input to running background jobs
    - Write exact UTF-8 text to a job's PTY stdin
@@ -179,6 +179,22 @@ Every `enhanced_terminal` tool call is appended as one JSON object per line to `
 
 Override the log path with `ENHANCED_TERMINAL_CALL_LOG_PATH` if needed.
 
+### Choosing a tool in OpenCode V2
+
+Use native `shell` for ordinary commands and background builds; background execution alone does not require this MCP. Use `enhanced_terminal` when you need direct `program` + `args`, interactive PTY stdin, task tags, or Windows task-tree cancellation.
+
+Supply **either** `command` (interpreted by the selected shell) **or** `program` with an `args` array. Program mode launches an executable directly; it preserves empty arguments, embedded quotes, Unicode, spaces and trailing backslashes using Windows executable argument quoting. No shell expansion, pipes, substitutions or Bash-to-PowerShell translation occurs. `.cmd`/`.bat` need explicit shell command mode; applications with custom command-line parsers can still have their own rules.
+
+```json
+{"program":"C:/Python314/python.exe","args":["show_args.py","a\"b","","中文"],"cwd":"C:/work/project","force_sync":true}
+```
+
+Windows jobs are associated with an unnamed Job Object immediately after PTY spawn, using the child handle rather than a PID lookup. Descendants created after association belong to that job. Cancellation is forceful and reports success only after its active process count reaches zero. External service/WMI launches and the short spawn-to-assignment interval are not a guarantee of descendant containment. If association fails, execution fails instead of reporting a cancellable job. The task group is closed on completion/server exit; deliberately detached services should use a separate service manager.
+
+Execution replies retain the full input command; the existing `job_status` option `full_command: true` remains available. Binary-scan JSON is compact but retains every field. Server instructions avoid repeating tool schemas. Output optimization does not lower the original 4096-token default or change a caller-selected budget.
+
+Output previews default to 4096 o200k tokens (a display budget, not the model's exact tokenizer). The captured stream is a raw PTY transcript, so terminal wrapping/repaints may repeat text; it is not a reconstructed stdout file. Complete decoded output stays in this server process's job history and is available in byte pages; it is not a persistent disk log and is lost when this MCP process exits. Every truncated response includes a concrete follow-up call. Do not fetch the entire log merely because a preview was truncated.
+
 ### Working Directory Defaults
 
 If `cwd` is omitted, it defaults to `.`. That `.` is resolved relative to the MCP server process working directory supplied by the caller/client. In practice, when Codex starts this MCP server from a project, omitted `cwd` uses that project/server launch directory. Pass `cwd` explicitly when you need a specific repository or subdirectory.
@@ -262,7 +278,7 @@ Job IDs are readable adjective-noun-number handles such as `brave-river-1`, maki
 
 #### enhanced_terminal_job_status
 
-Get full output. `job_status` returns the command summary by default; pass `full_command: true` only when you need the full command text:
+Read from the beginning (still preview-bounded; use `preview_tokens: 0` for unbounded output). `job_status` returns the command summary by default; pass `full_command: true` only when you need the full command text:
 ```json
 {
   "job_id": "brave-river-1",
@@ -483,7 +499,8 @@ Use `enhanced_terminal_job_status` with `incremental: true` for efficient pollin
 - First call returns all output accumulated so far
 - Subsequent calls return only new output since last check
 - Read position tracked per job_id
-- Reset by calling with `incremental: false`
+- Only bytes actually returned advance the incremental cursor; truncated remainder stays unread
+- Use `incremental: false` to read again from the beginning without resetting the cursor
 
 This enables streaming-like behavior without actual streaming infrastructure.
 
@@ -496,7 +513,9 @@ Use `enhanced_terminal_job_stdin` to write to a running job's PTY stdin after it
 For very long outputs, use pagination mode in `enhanced_terminal_job_status`:
 - Set `offset_bytes` to starting byte position
 - Set `limit_bytes` to number of bytes to select (0 = all remaining)
-- Returns `has_more` flag and `total_length`
+- Returns total byte length, returned byte range, `Has More`, and `Next Offset Bytes`
+- Use the returned next offset rather than adding the requested byte limit; UTF-8 boundaries can adjust a page
+- Set `preview_tokens: 0` for exact byte-page readback without a second token cutoff
 - Allows seeking into specific segments without retrieving full output
 
 Example workflow:
@@ -561,7 +580,7 @@ This server uses a modular structure with Rust 2024 edition:
 
 ### Default Values
 
-- **Shell**: `bash`
+- **Shell**: `cmd` on Windows, `bash` on other platforms
 - **Working Directory**: `.` resolved from the MCP server process working directory supplied by the caller/client
 - **Preview Tokens**: `4096` GPT-5/o200k_base tokens (`0` disables token truncation)
 - **Async Threshold**: `50` seconds (`ENHANCED_TERMINAL_ASYNC_THRESHOLD_SECS`)
@@ -574,3 +593,36 @@ This server uses a modular structure with Rust 2024 edition:
 ## License
 
 MIT License - see [LICENSE](LICENSE) file for details
+
+### Searching complete job output
+
+`enhanced_terminal_job_search` searches an immutable snapshot of one `job_id` from this MCP server. `mode: "literal"` (default) uses rg fixed strings; `"regex"` uses rg patterns; `"semantic"` uses the installed local sgrep text model offline with no persistent index. Tool discovery reuses OpenCode's cached rg and the existing sgrep installation; optional host environment overrides are `ENHANCED_TERMINAL_RG_BIN` / `ENHANCED_TERMINAL_SGREP_BIN`. PATH changes affect only the search child.
+
+```json
+{"job_id":"brave-river-1","query":"ELOCK","mode":"literal","limit":10,"context_lines":2,"context_bytes":4096}
+{"job_id":"brave-river-1","query":"recover after a temporary failure","mode":"semantic","limit":3}
+```
+
+The view is **stored UTF-8 raw PTY transcript**, with ANSI and cursor-repaint text preserved, not reconstructed stdout. A result identifies snapshot size, line range, byte positions and context source range. Semantic results locate relevant line blocks rather than exact query tokens. Context is an explicitly selected excerpt (`context_bytes`, 0 disables that excerpt limit); omitted surrounding bytes remain available using each result's exact `job_status` readback arguments. Search never scans the working directory or other jobs, changes the incremental cursor, or discards the original transcript. Temporary snapshots are removed when the search finishes. A service/index restart does not preserve in-memory job history.
+
+### Preview direction and cursors
+
+Initial previews take the **head**, using the original default 4096 o200k tokens; they do not accumulate lines backward from the tail. Token boundaries are adjusted only to keep UTF-8 valid. Initial capture also has the existing bounded byte buffer; full job history is separate. Synchronous and background modes have the same direction; an immediate background reply may have no output yet.
+
+`job_status` explicit `offset_bytes`/`limit_bytes` refer to the stored transcript's UTF-8 bytes, then `preview_tokens` applies. Follow returned offsets (UTF-8 page boundaries may adjust). Explicit pages never move the job's shared incremental cursor. Default incremental reads start at that cursor and advance only by bytes actually returned; `incremental: false` reads from the beginning without resetting it. Head remains the default. Use explicit `direction: "tail"` to read the suffix in normal order; `before_byte` is the exclusive backward continuation anchor. Preview limits and excerpt pagination are retrieval controls, not lossless deduplication.
+
+### Head/tail and line-addressed reads
+
+```json
+{"job_id":"brave-river-1","direction":"head","line_count":20}
+{"job_id":"brave-river-1","direction":"tail","line_count":20}
+{"job_id":"brave-river-1","start_line":40,"line_count":10}
+{"job_id":"brave-river-1","offset_bytes":500,"limit_bytes":4096,"preview_tokens":0}
+{"job_id":"brave-river-1","direction":"tail","before_byte":500,"limit_bytes":200}
+```
+
+These are `enhanced_terminal_job_status` arguments. Initial `enhanced_terminal` previews also accept `direction: "head" | "tail"`; the default is head. Tail always displays the selected suffix forward, not reversed. A line request and a byte request cannot be combined. Tail uses `line_count` or `limit_bytes`; use `before_byte`, not `offset_bytes`/`start_line`, to continue backward. Setting even `offset_bytes: 0` explicitly positions the read and does not take the shared incremental cursor.
+
+The body after `Output:` remains the exact selected raw transcript, without inserted line-number prefixes. Headers return its **1-based first/last line**, total line count and **0-based byte start/exclusive end**. `Read Metadata` gives machine-readable indices, `partial_line`, `partial_start`/`partial_end`, the selected envelope, and concrete continuation arguments. Line numbers count stored LF breaks (CRLF is one break), not screen rows or reconstructed stdout lines; ANSI cursor movement is not interpreted.
+
+One enormous line still obeys this call's token budget. Follow `Continue Selection` rather than repeating `start_line` when it is partial; use the returned end byte for forward reads, or returned start as `before_byte` for backward reads. Each tail page is forward-ordered; prepend older pages to reconstruct a transcript. Explicit reads, tail and search never change the shared incremental cursor. Byte boundaries are adjusted to whole UTF-8 code points (a one-byte page may therefore return one complete multibyte character). A token budget too small for even one code point is rejected rather than returning a non-advancing page. `preview_tokens: 0` explicitly disables the token limit; use `limit_bytes` to keep such reads bounded. The default remains 4096.

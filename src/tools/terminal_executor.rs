@@ -1,3 +1,4 @@
+use super::output_view::ReadDirection;
 use anyhow::Result;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use rmcp::{
@@ -21,19 +22,29 @@ use super::job_manager::{JobManager, JobStatus};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TerminalExecutionInput {
-    /// Command to execute
+    /// Shell command. Supply either command or program, never both.
+    #[serde(default)]
     pub command: String,
+    /// Executable path/name launched directly, without shell parsing.
+    #[serde(default)]
+    pub program: Option<String>,
+    /// Exact arguments for program, including empty strings and embedded quotes.
+    #[serde(default)]
+    pub args: Vec<String>,
     /// Working directory (default: "."). When omitted, "." is resolved from the
     /// MCP server process working directory supplied by the caller/client.
     #[serde(default = "default_cwd")]
     pub cwd: String,
-    /// Shell to use (default: "sh")
+    /// Shell for command mode (Windows: "cmd", other platforms: "bash")
     #[serde(default = "default_shell")]
     pub shell: String,
     /// Maximum number of GPT-5/o200k_base tokens to return in command output previews.
     /// Set to 0 to disable token truncation for the bounded in-memory preview buffer.
     #[serde(default = "default_preview_tokens")]
     pub preview_tokens: usize,
+    /// Initial preview direction, head by default; tail is displayed in normal order.
+    #[serde(default)]
+    pub direction: ReadDirection,
     /// Environment variables to set for the command
     #[serde(default)]
     pub env_vars: std::collections::HashMap<String, String>,
@@ -55,7 +66,7 @@ fn default_cwd() -> String {
     ".".to_string()
 }
 
-fn default_shell() -> String {
+pub fn default_shell() -> String {
     #[cfg(windows)]
     return "cmd".to_string();
     #[cfg(not(windows))]
@@ -108,8 +119,6 @@ pub struct PreviewedOutput {
     pub text: String,
     pub truncated: bool,
     pub tokens: Option<usize>,
-    pub token_limit: Option<usize>,
-    pub tokenizer: Option<&'static str>,
 }
 
 pub fn preview_output(text: &str, preview_tokens: usize) -> PreviewedOutput {
@@ -123,21 +132,21 @@ pub fn preview_output(text: &str, preview_tokens: usize) -> PreviewedOutput {
                 text: text.to_string(),
                 truncated: false,
                 tokens: Some(token_count),
-                token_limit: Some(preview_tokens),
-                tokenizer: Some("o200k_base"),
             };
         }
 
-        let preview = bpe
-            .decode(&tokens[..preview_tokens])
-            .unwrap_or_else(|_| text.chars().take(preview_tokens).collect());
+        // A token boundary can be inside a Unicode code point. Back off tokens,
+        // rather than replacing characters or exceeding the requested budget.
+        let mut end = preview_tokens;
+        let preview = loop {
+            if let Ok(text) = bpe.decode(&tokens[..end]) { break text; }
+            end -= 1;
+        };
 
         return PreviewedOutput {
             text: preview,
             truncated: true,
             tokens: Some(token_count),
-            token_limit: Some(preview_tokens),
-            tokenizer: Some("o200k_base"),
         };
     }
 
@@ -145,9 +154,40 @@ pub fn preview_output(text: &str, preview_tokens: usize) -> PreviewedOutput {
         text: text.to_string(),
         truncated: false,
         tokens: None,
-        token_limit: None,
-        tokenizer: None,
     }
+}
+
+pub fn preview_tail_output(text: &str, budget: usize) -> PreviewedOutput {
+    if budget == 0 { return preview_output(text, 0); }
+    let bpe = o200k_base_singleton();
+    let tokens = bpe.encode_ordinary(text);
+    if tokens.len() <= budget { return preview_output(text, budget); }
+    let mut start = tokens.len() - budget;
+    let tail = loop {
+        if let Ok(text) = bpe.decode(&tokens[start..]) { break text; }
+        start += 1;
+    };
+    PreviewedOutput { text: tail, truncated: true, tokens: Some(tokens.len()) }
+}
+
+fn preview_for_direction(text: &str, budget: usize, direction: ReadDirection) -> PreviewedOutput {
+    match direction { ReadDirection::Head => preview_output(text, budget), ReadDirection::Tail => preview_tail_output(text, budget) }
+}
+
+fn append_to_capture(buffer: &mut Vec<u8>, data: &[u8], limit: usize, direction: ReadDirection) -> bool {
+    if direction == ReadDirection::Head { return append_to_preview_buffer(buffer, data, limit); }
+    if data.len() >= limit {
+        let mut start = data.len() - limit;
+        while start < data.len() && data[start] & 0xc0 == 0x80 { start += 1; }
+        let dropped = !buffer.is_empty() || start > 0;
+        buffer.clear(); buffer.extend_from_slice(&data[start..]);
+        return dropped;
+    }
+    let mut remove = (buffer.len() + data.len()).saturating_sub(limit);
+    while remove < buffer.len() && buffer[remove] & 0xc0 == 0x80 { remove += 1; }
+    if remove > 0 { buffer.drain(..remove); }
+    buffer.extend_from_slice(data);
+    remove > 0
 }
 
 fn preview_buffer_limit(input: &TerminalExecutionInput) -> usize {
@@ -173,9 +213,86 @@ fn append_to_preview_buffer(buffer: &mut Vec<u8>, data: &[u8], limit: usize) -> 
         buffer.extend_from_slice(data);
         false
     } else {
-        buffer.extend_from_slice(&data[..remaining]);
+        let mut end = remaining;
+        while end > 0 && std::str::from_utf8(&data[..end]).is_err() { end -= 1; }
+        buffer.extend_from_slice(&data[..end]);
         true
     }
+}
+
+#[derive(Default)]
+struct Utf8StreamDecoder { pending: Vec<u8> }
+
+impl Utf8StreamDecoder {
+    fn push(&mut self, data: &[u8]) -> String {
+        self.pending.extend_from_slice(data);
+        let mut output = String::new();
+        let mut consumed = 0;
+        loop {
+            match std::str::from_utf8(&self.pending[consumed..]) {
+                Ok(valid) => { output.push_str(valid); consumed = self.pending.len(); break; }
+                Err(error) => {
+                    let valid_end = consumed + error.valid_up_to();
+                    output.push_str(std::str::from_utf8(&self.pending[consumed..valid_end]).unwrap());
+                    consumed = valid_end;
+                    match error.error_len() {
+                        Some(n) => { output.push('\u{fffd}'); consumed += n; }
+                        None => break, // Keep an incomplete code point for the next read.
+                    }
+                }
+            }
+        }
+        self.pending.drain(..consumed);
+        output
+    }
+
+    fn finish(&mut self) -> String {
+        let tail = String::from_utf8_lossy(&self.pending).into_owned();
+        self.pending.clear();
+        tail
+    }
+}
+
+#[cfg(windows)]
+fn windows_working_directory(cwd: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut parts = cwd.components();
+    if let Some(Component::Prefix(prefix)) = parts.next() {
+        if let Prefix::VerbatimDisk(drive) = prefix.kind() {
+            if matches!(parts.next(), Some(Component::RootDir)) {
+                // CMD rejects the extended local-drive form as UNC and changes cwd.
+                // Rebuild components without lossy Unicode conversion; preserve UNC/devices.
+                let mut ordinary = PathBuf::from(format!("{}:\\", char::from(drive)));
+                ordinary.extend(parts);
+                return ordinary;
+            }
+        }
+    }
+    cwd
+}
+
+fn build_command(command: &str, input: &TerminalExecutionInput) -> CommandBuilder {
+    if let Some(program) = &input.program {
+        let mut cmd = CommandBuilder::new(program);
+        cmd.args(&input.args);
+        return cmd;
+    }
+    let mut cmd = CommandBuilder::new(&input.shell);
+    #[cfg(windows)]
+    if input.shell == "cmd" {
+        cmd.arg("/C");
+        cmd.arg(command);
+    } else {
+        cmd.arg("-c");
+        // Preserve the fork's PowerShell PTY completion behavior.
+        cmd.arg(format!("{command}\n exit"));
+    }
+    #[cfg(not(windows))]
+    {
+        cmd.arg("-c");
+        cmd.arg(command);
+    }
+    cmd
 }
 
 #[derive(Debug, Serialize)]
@@ -201,7 +318,25 @@ pub async fn execute_command(
     job_manager: &JobManager,
     peer: Option<Peer<RoleServer>>,
 ) -> Result<ExecutionResult> {
-    let command = input.command.trim();
+    if input.program.as_deref().is_some_and(|p| p.trim().is_empty()) {
+        anyhow::bail!("program cannot be empty");
+    }
+    if input.program.is_some() && !input.command.trim().is_empty() {
+        anyhow::bail!("Supply either command or program, not both");
+    }
+    if input.program.is_none() && !input.args.is_empty() {
+        anyhow::bail!("args requires program");
+    }
+    #[cfg(windows)]
+    if input.program.as_deref().is_some_and(|p| {
+        let p = p.to_ascii_lowercase(); p.ends_with(".cmd") || p.ends_with(".bat")
+    }) {
+        anyhow::bail!("program must be a native executable; use command for .cmd/.bat scripts");
+    }
+    let display = input.program.as_ref().map(|program| {
+        format!("{} {}", program, serde_json::to_string(&input.args).unwrap())
+    });
+    let command = display.as_deref().unwrap_or(input.command.trim());
 
     tracing::debug!(
         "execute_command called: command={}, force_sync={}, force_async={}",
@@ -216,13 +351,15 @@ pub async fn execute_command(
     // - the actual privileged command runs via `sudo -n` so it never prompts
     //
     // This allows sudo timestamp reuse across multiple tool calls.
-    if env_bool("ENHANCED_TERMINAL_SUDO_WRAP") && sudo_looks_used(command) {
+    if input.program.is_none() && env_bool("ENHANCED_TERMINAL_SUDO_WRAP") && sudo_looks_used(command) {
         let report = ensure_sudo_primed_for_wrap(command, &input.env_vars).await;
         let wrapped = wrap_sudo_command_for_server(command);
         return execute_command_inner(&wrapped, input, job_manager, report, peer).await;
     }
 
-    let sudo_prime_report = maybe_start_sudo_keepalive(command, &input.env_vars).await;
+    let sudo_prime_report = if input.program.is_none() {
+        maybe_start_sudo_keepalive(command, &input.env_vars).await
+    } else { None };
 
     if command.is_empty() {
         return Err(anyhow::anyhow!("Command cannot be empty"));
@@ -260,6 +397,8 @@ pub async fn execute_command(
 
     // Canonicalize to resolve symlinks
     let cwd = cwd.canonicalize().unwrap_or(cwd);
+    #[cfg(windows)]
+    let cwd = windows_working_directory(cwd);
 
     // Create PTY system
     let pty_system = native_pty_system();
@@ -272,24 +411,7 @@ pub async fn execute_command(
         })
         .map_err(|e| anyhow::anyhow!("Failed to open PTY: {}", e))?;
 
-    // Build command
-    let mut cmd = CommandBuilder::new(&input.shell);
-    #[cfg(windows)]
-    if input.shell == "cmd" {
-        cmd.arg("/C");
-        cmd.arg(command);
-    } else {
-        cmd.arg("-c");
-        // PowerShell keeps running when its stdin is a PTY even after -Command
-        // finishes; append an explicit exit so the process terminates and sync
-        // calls complete instead of timing out.
-        cmd.arg(format!("{command}\n exit"));
-    }
-    #[cfg(not(windows))]
-    {
-        cmd.arg("-c");
-        cmd.arg(command);
-    }
+    let mut cmd = build_command(command, input);
     cmd.cwd(&cwd);
 
     // Set environment variables
@@ -309,10 +431,15 @@ pub async fn execute_command(
 
     // Register job
     let job_id = job_manager.new_job_id();
+    #[cfg(windows)]
+    if let Err(error) = job_manager.attach_windows_job(&job_id, child.as_ref()) {
+        let _ = child.kill();
+        return Err(error.context("Failed to own PTY process tree"));
+    }
     job_manager.register_job_with_tags(
         job_id.clone(),
         command.to_string(),
-        input.shell.clone(),
+        if input.program.is_some() { "direct".to_string() } else { input.shell.clone() },
         cwd.display().to_string(),
         pid,
         input.tags.clone(),
@@ -353,16 +480,19 @@ pub async fn execute_command(
     let reader_job_id = job_id.clone();
     tokio::task::spawn_blocking(move || {
         let mut buffer = [0u8; 4096];
+        let mut decoder = Utf8StreamDecoder::default();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => {
                     tracing::debug!("Reader task: EOF, job_id={}", reader_job_id);
+                    let tail = decoder.finish();
+                    if !tail.is_empty() { let _ = tx.send(ReadMsg::Data(tail.into_bytes())); }
                     let _ = tx.send(ReadMsg::Eof);
                     break;
                 }
                 Ok(n) => {
-                    let data = buffer[..n].to_vec();
-                    if tx.send(ReadMsg::Data(data)).is_err() {
+                    let data = decoder.push(&buffer[..n]).into_bytes();
+                    if !data.is_empty() && tx.send(ReadMsg::Data(data)).is_err() {
                         break; // Main task dropped receiver
                     }
                 }
@@ -372,6 +502,8 @@ pub async fn execute_command(
                 }
                 Err(e) => {
                     tracing::warn!("Reader task error: {:?}, job_id={}", e, reader_job_id);
+                    let tail = decoder.finish();
+                    if !tail.is_empty() { let _ = tx.send(ReadMsg::Data(tail.into_bytes())); }
                     let _ = tx.send(ReadMsg::Error);
                     break;
                 }
@@ -412,7 +544,7 @@ pub async fn execute_command(
         // Try to receive output from reader task with timeout
         match tokio::time::timeout(check_interval, rx.recv()).await {
             Ok(Some(ReadMsg::Data(data))) => {
-                truncated |= append_to_preview_buffer(&mut output, &data, preview_byte_limit);
+                truncated |= append_to_capture(&mut output, &data, preview_byte_limit, input.direction);
 
                 // Update job with incremental output
                 let output_str = String::from_utf8_lossy(&data).to_string();
@@ -565,7 +697,7 @@ pub async fn execute_command(
 
         // Return immediately with a bounded preview and duration so far.
         let raw_output_str = String::from_utf8_lossy(&output).to_string();
-        let preview = preview_output(&raw_output_str, input.preview_tokens);
+        let preview = preview_for_direction(&raw_output_str, input.preview_tokens, input.direction);
         let output_str = preview.text;
         truncated |= preview.truncated;
         let duration_secs = start_time.elapsed().as_secs_f64();
@@ -601,7 +733,7 @@ pub async fn execute_command(
     let success = exit_code.map(|c| c == 0).unwrap_or(false);
 
     let raw_output_str = String::from_utf8_lossy(&output).to_string();
-    let preview = preview_output(&raw_output_str, input.preview_tokens);
+    let preview = preview_for_direction(&raw_output_str, input.preview_tokens, input.direction);
     let mut output_str = preview.text;
     truncated |= preview.truncated;
 
@@ -727,6 +859,8 @@ async fn execute_command_inner(
 
     // Canonicalize to resolve symlinks
     let cwd = cwd.canonicalize().unwrap_or(cwd);
+    #[cfg(windows)]
+    let cwd = windows_working_directory(cwd);
 
     // Create PTY system
     let pty_system = native_pty_system();
@@ -739,24 +873,7 @@ async fn execute_command_inner(
         })
         .map_err(|e| anyhow::anyhow!("Failed to open PTY: {}", e))?;
 
-    // Build command
-    let mut cmd = CommandBuilder::new(&input.shell);
-    #[cfg(windows)]
-    if input.shell == "cmd" {
-        cmd.arg("/C");
-        cmd.arg(command);
-    } else {
-        cmd.arg("-c");
-        // PowerShell keeps running when its stdin is a PTY even after -Command
-        // finishes; append an explicit exit so the process terminates and sync
-        // calls complete instead of timing out.
-        cmd.arg(format!("{command}\n exit"));
-    }
-    #[cfg(not(windows))]
-    {
-        cmd.arg("-c");
-        cmd.arg(command);
-    }
+    let mut cmd = build_command(command, input);
     cmd.cwd(&cwd);
 
     // Set environment variables
@@ -776,10 +893,15 @@ async fn execute_command_inner(
 
     // Register job
     let job_id = job_manager.new_job_id();
+    #[cfg(windows)]
+    if let Err(error) = job_manager.attach_windows_job(&job_id, child.as_ref()) {
+        let _ = child.kill();
+        return Err(error.context("Failed to own PTY process tree"));
+    }
     job_manager.register_job_with_tags(
         job_id.clone(),
         command.to_string(),
-        input.shell.clone(),
+        if input.program.is_some() { "direct".to_string() } else { input.shell.clone() },
         cwd.display().to_string(),
         pid,
         input.tags.clone(),
@@ -820,16 +942,19 @@ async fn execute_command_inner(
     let reader_job_id = job_id.clone();
     tokio::task::spawn_blocking(move || {
         let mut buffer = [0u8; 4096];
+        let mut decoder = Utf8StreamDecoder::default();
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => {
                     tracing::debug!("Reader task: EOF, job_id={}", reader_job_id);
+                    let tail = decoder.finish();
+                    if !tail.is_empty() { let _ = tx.send(ReadMsg::Data(tail.into_bytes())); }
                     let _ = tx.send(ReadMsg::Eof);
                     break;
                 }
                 Ok(n) => {
-                    let data = buffer[..n].to_vec();
-                    if tx.send(ReadMsg::Data(data)).is_err() {
+                    let data = decoder.push(&buffer[..n]).into_bytes();
+                    if !data.is_empty() && tx.send(ReadMsg::Data(data)).is_err() {
                         break; // Main task dropped receiver
                     }
                 }
@@ -839,6 +964,8 @@ async fn execute_command_inner(
                 }
                 Err(e) => {
                     tracing::warn!("Reader task error: {:?}, job_id={}", e, reader_job_id);
+                    let tail = decoder.finish();
+                    if !tail.is_empty() { let _ = tx.send(ReadMsg::Data(tail.into_bytes())); }
                     let _ = tx.send(ReadMsg::Error);
                     break;
                 }
@@ -879,7 +1006,7 @@ async fn execute_command_inner(
         // Try to receive output from reader task with timeout
         match tokio::time::timeout(check_interval, rx.recv()).await {
             Ok(Some(ReadMsg::Data(data))) => {
-                truncated |= append_to_preview_buffer(&mut output, &data, preview_byte_limit);
+                truncated |= append_to_capture(&mut output, &data, preview_byte_limit, input.direction);
 
                 // Update job with incremental output
                 let output_str = String::from_utf8_lossy(&data).to_string();
@@ -1032,7 +1159,7 @@ async fn execute_command_inner(
 
         // Return immediately with a bounded preview and duration so far.
         let raw_output_str = String::from_utf8_lossy(&output).to_string();
-        let preview = preview_output(&raw_output_str, input.preview_tokens);
+        let preview = preview_for_direction(&raw_output_str, input.preview_tokens, input.direction);
         let mut output_str = preview.text;
         truncated |= preview.truncated;
         let duration_secs = start_time.elapsed().as_secs_f64();
@@ -1101,7 +1228,7 @@ async fn execute_command_inner(
     let success = exit_code.map(|c| c == 0).unwrap_or(false);
 
     let raw_output_str = String::from_utf8_lossy(&output).to_string();
-    let preview = preview_output(&raw_output_str, input.preview_tokens);
+    let preview = preview_for_direction(&raw_output_str, input.preview_tokens, input.direction);
     let mut output_str = preview.text;
     truncated |= preview.truncated;
 
@@ -1567,4 +1694,42 @@ async fn maybe_start_sudo_keepalive(
         }
     });
     None
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn cmd_cwd_normalizes_only_extended_local_drives() {
+        assert_eq!(
+            windows_working_directory(PathBuf::from(r"\\?\C:\目录 with spaces\文件")),
+            PathBuf::from(r"C:\目录 with spaces\文件"),
+        );
+        for untouched in [r"C:\普通路径", r"\\?\UNC\server\share\目录", r"\\?\Volume{example}\目录"] {
+            assert_eq!(windows_working_directory(PathBuf::from(untouched)), PathBuf::from(untouched));
+        }
+    }
+
+    #[test]
+    fn split_utf8_and_preview_boundary_preserve_chinese() {
+        let expected = "中文🙂末尾";
+        for size in 1..=7 {
+            let mut decoder = Utf8StreamDecoder::default();
+            let mut output = String::new();
+            for chunk in expected.as_bytes().chunks(size) { output.push_str(&decoder.push(chunk)); }
+            output.push_str(&decoder.finish());
+            assert_eq!(output, expected);
+        }
+        let mut buffer = Vec::new();
+        assert!(append_to_preview_buffer(&mut buffer, "中文".as_bytes(), 4));
+        assert_eq!(String::from_utf8(buffer).unwrap(), "中");
+        let source = "中🙂文".repeat(8);
+        for budget in 1..=10 {
+            let preview = preview_output(&source, budget);
+            assert!(source.starts_with(&preview.text));
+            assert!(!preview.text.contains('\u{fffd}'));
+            assert!(o200k_base_singleton().encode_ordinary(&preview.text).len() <= budget);
+        }
+    }
 }
