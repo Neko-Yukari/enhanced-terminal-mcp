@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum JobStatus {
     Running,
+    /// Process is alive but appears to be blocked on an interactive prompt.
+    WaitingForInput,
     Completed,
     Failed,
     TimedOut,
@@ -35,6 +37,8 @@ pub struct JobRecord {
     pub tags: Vec<String>,
     /// Command summary (first N characters)
     pub summary: String,
+    /// Prompt line observed while the job waits for stdin input
+    pub input_hint: Option<String>,
 }
 
 impl JobRecord {
@@ -215,6 +219,7 @@ impl JobManager {
                 last_read_position: 0,
                 tags,
                 summary,
+                input_hint: None,
             },
         );
     }
@@ -238,6 +243,28 @@ impl JobManager {
         }
     }
 
+    /// Mark a live job as waiting on an interactive prompt.
+    pub fn mark_waiting_input(&self, job_id: &str, hint: &str) {
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(job) = jobs.get_mut(job_id) {
+            if matches!(job.status, JobStatus::Running | JobStatus::WaitingForInput) {
+                job.status = JobStatus::WaitingForInput;
+                job.input_hint = Some(hint.to_string());
+            }
+        }
+    }
+
+    /// Return a waiting job to Running once it produces new output.
+    pub fn clear_waiting_input(&self, job_id: &str) {
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(job) = jobs.get_mut(job_id) {
+            if matches!(job.status, JobStatus::WaitingForInput) {
+                job.status = JobStatus::Running;
+            }
+            job.input_hint = None;
+        }
+    }
+
     /// Attach a PTY stdin writer to a running job.
     pub fn attach_stdin_writer(&self, job_id: &str, writer: Box<dyn Write + Send>) {
         let mut writers = self.stdin_writers.lock().unwrap();
@@ -251,7 +278,7 @@ impl JobManager {
             let job = jobs
                 .get(job_id)
                 .ok_or_else(|| anyhow::anyhow!("Job not found"))?;
-            if !matches!(job.status, JobStatus::Running) {
+            if !matches!(job.status, JobStatus::Running | JobStatus::WaitingForInput) {
                 return Err(anyhow::anyhow!("Job is not running"));
             }
         }
@@ -288,7 +315,12 @@ impl JobManager {
         if let Some(job) = jobs.get_mut(job_id) {
             job.finished_at = Some(SystemTime::now());
             job.exit_code = exit_code;
-            job.status = status;
+            job.input_hint = None;
+            // A canceled job must not be resurrected as Completed when its orphaned child
+            // notices the closed stdin and exits.
+            if !matches!(job.status, JobStatus::Canceled) {
+                job.status = status;
+            }
         }
     }
 
@@ -304,7 +336,10 @@ impl JobManager {
         if let Some(job) = jobs.get_mut(job_id) {
             let new_output = job.full_output[job.last_read_position..].to_string();
             job.last_read_position = job.full_output.len();
-            Some((new_output, matches!(job.status, JobStatus::Running)))
+            Some((
+                new_output,
+                matches!(job.status, JobStatus::Running | JobStatus::WaitingForInput),
+            ))
         } else {
             None
         }
@@ -435,7 +470,7 @@ impl JobManager {
         let canceled = {
             let mut jobs = self.jobs.lock().unwrap();
             if let Some(job) = jobs.get_mut(job_id) {
-                if matches!(job.status, JobStatus::Running) {
+                if matches!(job.status, JobStatus::Running | JobStatus::WaitingForInput) {
                     if let Some(pid) = job.pid {
                         let pid = Pid::from_raw(pid as i32);
                         kill(pid, Signal::SIGTERM)?;
@@ -462,27 +497,42 @@ impl JobManager {
 
     #[cfg(not(unix))]
     pub fn cancel_job(&self, job_id: &str) -> Result<()> {
-        let canceled = {
+        let canceled_pid = {
             let mut jobs = self.jobs.lock().unwrap();
             if let Some(job) = jobs.get_mut(job_id) {
-                if matches!(job.status, JobStatus::Running) {
+                if matches!(job.status, JobStatus::Running | JobStatus::WaitingForInput) {
                     job.status = JobStatus::Canceled;
                     job.finished_at = Some(SystemTime::now());
-                    true
+                    job.input_hint = None;
+                    job.pid
                 } else {
-                    false
+                    None
                 }
             } else {
-                false
+                None
             }
         };
 
-        if canceled {
-            self.stdin_writers.lock().unwrap().remove(job_id);
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Job not found or not running"))
+        let Some(pid) = canceled_pid else {
+            // Either unknown or a job that had no pid: nothing to kill.
+            if self.jobs.lock().unwrap().get(job_id).is_some() {
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!("Job not found or not running"));
+        };
+
+        // Windows has no SIGTERM: kill the whole tree so children (pagers, shell
+        // wrappers) do not survive as orphans when a job is cancelled.
+        let killed = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output();
+
+        if let Err(e) = killed {
+            tracing::warn!("taskkill failed for job_id={}, pid={}: {}", job_id, pid, e);
         }
+
+        self.stdin_writers.lock().unwrap().remove(job_id);
+        Ok(())
     }
 
     /// Delete a job from history

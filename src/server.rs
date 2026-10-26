@@ -1,5 +1,7 @@
 use crate::detection::{detect_binaries, detect_shells};
-use crate::tools::{JobManager, TerminalExecutionInput, execute_command, preview_output};
+use crate::tools::{
+    JobManager, TerminalExecutionInput, execute_command, is_credential_hint, preview_output,
+};
 use chrono::{SecondsFormat, Utc};
 use rmcp::{
     ErrorData as McpError, Peer, handler::server::router::tool::ToolRouter,
@@ -335,7 +337,16 @@ RETURNS:
                     duration
                 ));
             }
-            result_text.push_str("Status: SWITCHED TO BACKGROUND\n");
+            match result.status.as_deref() {
+                Some(status) => result_text.push_str(&format!("Status: {}\n", status)),
+                None => result_text.push_str("Status: SWITCHED TO BACKGROUND\n"),
+            }
+            if let Some(hint) = result.input_hint.as_deref() {
+                result_text.push_str(&format!("Input Hint: {}\n", hint));
+            }
+            if let Some(note) = result.note.as_deref() {
+                result_text.push_str(&format!("Note: {}\n", note));
+            }
             result_text
                 .push_str("The command is still running. Use enhanced_terminal_job_status to check progress.\n");
             result_text.push_str("\nPartial Output:\n");
@@ -420,7 +431,7 @@ RETURNS:
 - summary: Short command summary returned by default
 - shell: Shell used for execution
 - cwd: Working directory
-- status: Current job status (Running, Completed, Failed, TimedOut, Canceled)
+- status: Current job status (Running, WaitingForInput, Completed, Failed, TimedOut, Canceled)
 - exit_code: Exit code (if completed)
 - pid: Process ID (if available)
 - duration: Time elapsed since job start
@@ -507,6 +518,16 @@ RETURNS:
         result_text.push_str(&format!("Shell: {}\n", job.shell));
         result_text.push_str(&format!("Working Directory: {}\n", job.cwd));
         result_text.push_str(&format!("Status: {:?}\n", job.status));
+
+        if let Some(hint) = job.input_hint.as_deref() {
+            result_text.push_str(&format!("Input Hint: {}\n", hint));
+            if is_credential_hint(hint) {
+                result_text.push_str(
+                    "Note: This looks like a credential prompt. Do not send secrets through \
+                     enhanced_terminal_job_stdin — ask the user to confirm or cancel the job.\n",
+                );
+            }
+        }
 
         if !job.tags.is_empty() {
             result_text.push_str(&format!("Tags: {}\n", job.tags.join(", ")));
@@ -625,7 +646,7 @@ RETURNS: List of jobs with:
 - job_id: Unique readable adjective-noun-number identifier
 - command: Full executed command
 - summary: First 100 characters of command
-- status: Current status (Running, Completed, Failed, TimedOut, Canceled)
+- status: Current status (Running, WaitingForInput, Completed, Failed, TimedOut, Canceled)
 - exit_code: Exit code if completed
 - duration: Time elapsed since start
 - tags: Optional tags assigned to this job
@@ -640,19 +661,23 @@ RETURNS: List of jobs with:
         use crate::tools::JobStatus;
 
         // Parse status filter if provided
-        let status_filter: Option<Vec<JobStatus>> = input.status_filter.as_ref().map(|filters| {
-            filters
-                .iter()
-                .filter_map(|s| match s.as_str() {
-                    "Running" => Some(JobStatus::Running),
-                    "Completed" => Some(JobStatus::Completed),
-                    "Failed" => Some(JobStatus::Failed),
-                    "TimedOut" => Some(JobStatus::TimedOut),
-                    "Canceled" => Some(JobStatus::Canceled),
-                    _ => None,
-                })
-                .collect()
-        });
+        let status_filter: Option<Vec<JobStatus>> =
+            input.status_filter.as_ref().and_then(|filters| {
+                let parsed: Vec<JobStatus> = filters
+                    .iter()
+                    .filter_map(|s| match s.as_str() {
+                        "Running" => Some(JobStatus::Running),
+                        "WaitingForInput" => Some(JobStatus::WaitingForInput),
+                        "Completed" => Some(JobStatus::Completed),
+                        "Failed" => Some(JobStatus::Failed),
+                        "TimedOut" => Some(JobStatus::TimedOut),
+                        "Canceled" => Some(JobStatus::Canceled),
+                        _ => None,
+                    })
+                    .collect();
+                // An unparsable filter must not silently hide every job.
+                if parsed.is_empty() { None } else { Some(parsed) }
+            });
 
         // Get filtered jobs
         let mut jobs = if input.status_filter.is_some()
@@ -760,7 +785,7 @@ PARAMETERS:
 - input (string, required): Exact UTF-8 input to write; include \n to submit a line
 
 BEHAVIOR:
-- Writes to the PTY stdin for a job that is still Running
+- Writes to the PTY stdin for a job that is Running or WaitingForInput
 - Does not append a newline automatically
 - Useful for answering prompts or interacting with commands after they switch to background
 
@@ -771,6 +796,24 @@ RETURNS:
         &self,
         Parameters(input): Parameters<JobStdinInput>,
     ) -> Result<CallToolResult, McpError> {
+        // Credential prompts must not be answered by the model itself.
+        if let Some(job) = self.job_manager.get_job(&input.job_id) {
+            if matches!(job.status, crate::tools::JobStatus::WaitingForInput) {
+                if let Some(hint) = job.input_hint.as_deref() {
+                    if is_credential_hint(hint) {
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "Job {} is waiting on a credential prompt ({:?}). Do not send secrets \
+                                 through job_stdin — ask the user to confirm or cancel the job.",
+                                input.job_id, hint
+                            ),
+                            None::<serde_json::Value>,
+                        ));
+                    }
+                }
+            }
+        }
+
         let bytes_written = self
             .job_manager
             .write_stdin(&input.job_id, &input.input)
@@ -893,7 +936,7 @@ impl rmcp::ServerHandler for EnhancedTerminalServer {
                • Returns: readable adjective-noun-number job_id for tracking background execution\n\
             \n\
             2. enhanced_terminal_job_status - Monitor background jobs\n\
-               • Get current status: Running, Completed, Failed, TimedOut, Canceled\n\
+               • Get current status: Running, WaitingForInput, Completed, Failed, TimedOut, Canceled\n\
                • Output modes: Incremental (default, new since last check) or Full (all output)\n\
                • Incremental mode is default and recommended for efficiency\n\
                • Set incremental=false to get all output from start\n\
@@ -925,7 +968,8 @@ impl rmcp::ServerHandler for EnhancedTerminalServer {
             Commands exceeding 50 seconds automatically move to background (configurable via\n\
             ENHANCED_TERMINAL_ASYNC_THRESHOLD_SECS environment variable, defaults to 50).\n\
             Returns immediately with a readable adjective-noun-number job_id. Use enhanced_terminal_job_status with incremental=true to poll for updates, and enhanced_terminal_job_stdin to send input to prompts.\n\
-            Set force_sync=true to wait for completion regardless of duration, or force_async=true to return a job_id immediately.\n\
+            Set force_sync=true to wait for completion regardless of duration — except that a detected\n\
+            input prompt always returns early — or force_async=true to return a job_id immediately.\n\
             \n\
             ENVIRONMENT VARIABLES:\n\
             Set environment variables via env_vars parameter:\n\

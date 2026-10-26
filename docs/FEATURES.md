@@ -41,7 +41,7 @@ Returns immediately with job ID after 5 seconds if still running.
 
 #### job_status
 Get detailed status and output of any job:
-- Current status (Running, Completed, Failed, TimedOut, Canceled)
+- Current status (Running, WaitingForInput, Completed, Failed, TimedOut, Canceled)
 - Exit code (if completed)
 - Duration
 - Full output (respects output limits)

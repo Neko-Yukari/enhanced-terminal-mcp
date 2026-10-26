@@ -475,7 +475,7 @@ Commands that exceed the server async threshold (default: 50 seconds, configurab
 - Timeout issues with package installations
 - Slow build processes hanging the interface
 
-Set `force_sync: true` to disable this behavior for specific commands. Set `force_async: true` to return a job ID immediately without waiting for the threshold, which is the recommended flow before using `enhanced_terminal_job_stdin`.
+Set `force_sync: true` to disable this behavior for specific commands — except that a detected input prompt (`Status: WaitingForInput`) always returns early. Set `force_async: true` to return a job ID immediately without waiting for the threshold, which is the recommended flow before using `enhanced_terminal_job_stdin`.
 
 ### Incremental Output
 

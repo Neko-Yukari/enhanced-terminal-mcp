@@ -87,6 +87,20 @@ fn apply_default_env(mut env_vars: HashMap<String, String>) -> HashMap<String, S
     env_vars
         .entry("COLORTERM".to_string())
         .or_insert_with(|| "0".to_string());
+    // Pagers block forever on a PTY (git log -> less waits for `q`); an agent
+    // never wants them. Fail git credential prompts instead of hanging too.
+    env_vars
+        .entry("PAGER".to_string())
+        .or_insert_with(|| "cat".to_string());
+    env_vars
+        .entry("GIT_PAGER".to_string())
+        .or_insert_with(|| "cat".to_string());
+    env_vars
+        .entry("GH_PAGER".to_string())
+        .or_insert_with(|| "cat".to_string());
+    env_vars
+        .entry("GIT_TERMINAL_PROMPT".to_string())
+        .or_insert_with(|| "0".to_string());
     env_vars
 }
 
@@ -178,6 +192,128 @@ fn append_to_preview_buffer(buffer: &mut Vec<u8>, data: &[u8], limit: usize) -> 
     }
 }
 
+/// Bytes of recent output kept for prompt detection.
+const INPUT_TAIL_BYTES: usize = 256;
+/// Maximum characters kept from a detected prompt line.
+const INPUT_HINT_MAX_CHARS: usize = 200;
+
+fn append_to_input_tail(tail: &mut Vec<u8>, data: &[u8]) {
+    tail.extend_from_slice(data);
+    if tail.len() > INPUT_TAIL_BYTES {
+        let excess = tail.len() - INPUT_TAIL_BYTES;
+        tail.drain(..excess);
+    }
+}
+
+/// Remove ANSI escape sequences (CSI, OSC, and short escapes) from raw terminal output.
+fn strip_ansi_escapes(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0;
+    while i < input.len() {
+        if input[i] != 0x1b {
+            out.push(input[i]);
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        match input.get(i) {
+            Some(b'[') => {
+                i += 1;
+                while i < input.len() {
+                    let byte = input[i];
+                    i += 1;
+                    if (0x40..=0x7e).contains(&byte) {
+                        break;
+                    }
+                }
+            }
+            Some(b']') => {
+                i += 1;
+                while i < input.len() {
+                    if input[i] == 0x07 {
+                        i += 1;
+                        break;
+                    }
+                    if input[i] == 0x1b && input.get(i + 1) == Some(&b'\\') {
+                        i += 2;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            Some(_) => i += 1,
+            None => {}
+        }
+    }
+    out
+}
+
+/// Detect a trailing interactive prompt in recent output.
+///
+/// Returns the (ANSI-stripped, trimmed, truncated) prompt line when the output ends
+/// on an unterminated line that looks like a question, a choice, or a credential
+/// request. Output that ends with a newline is considered settled, not waiting.
+pub fn detect_input_prompt(tail: &[u8]) -> Option<String> {
+    if tail.last().is_some_and(|b| *b == b'\n' || *b == b'\r') {
+        return None;
+    }
+
+    let cleaned = strip_ansi_escapes(tail);
+    let line_start = cleaned
+        .iter()
+        .rposition(|b| *b == b'\n' || *b == b'\r')
+        .map(|pos| pos + 1)
+        .unwrap_or(0);
+    let line = String::from_utf8_lossy(&cleaned[line_start..]);
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+
+    let lower = line.to_ascii_lowercase();
+    let looks_like_prompt = lower.ends_with('?')
+        || lower.ends_with(':')
+        || lower.ends_with('>')
+        || lower.contains("password:")
+        || lower.contains("passphrase:")
+        || lower.contains("[y/n]")
+        || lower.contains("(y/n)")
+        || lower.contains("[y/n/a]")
+        || lower.contains("press any key");
+    if !looks_like_prompt {
+        return None;
+    }
+
+    // Keep the tail of the line, not the head: the 256-byte window can cut the
+    // beginning, and the character that triggered the match sits at the end.
+    let chars: Vec<char> = line.chars().collect();
+    let start = chars.len().saturating_sub(INPUT_HINT_MAX_CHARS);
+    Some(chars[start..].iter().collect())
+}
+
+/// True when a detected prompt is asking for a secret.
+pub fn is_credential_hint(hint: &str) -> bool {
+    let lower = hint.to_ascii_lowercase();
+    lower.contains("password") || lower.contains("passphrase")
+}
+
+/// Caller-facing guidance for a job that stopped on an interactive prompt.
+fn waiting_input_note(hint: &str) -> String {
+    let mut note = String::from(
+        "The command appears to be waiting for terminal input. Answer it with enhanced_terminal_job_stdin \
+         (append \\n to submit the line), or terminate it with enhanced_terminal_job_cancel \
+         (on Windows the job is marked canceled; the process may need a manual kill).",
+    );
+    if is_credential_hint(hint) {
+        note.push_str(
+            " This looks like a credential prompt: do not send secrets through job_stdin — ask the user \
+             to confirm or cancel the job instead.",
+        );
+    }
+    note
+}
+
 #[derive(Debug, Serialize)]
 pub struct ExecutionResult {
     pub job_id: String,
@@ -194,6 +330,15 @@ pub struct ExecutionResult {
     pub duration_secs: Option<f64>,
     /// What was added/prepended to sudo commands (e.g., "-n" for non-interactive)
     pub sudo_wrapper_applied: Option<String>,
+    /// Set when the call ended without completing; e.g. "WaitingForInput".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Prompt line observed when the command is blocked on stdin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_hint: Option<String>,
+    /// Guidance for the caller about the reported status.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 pub async fn execute_command(
@@ -248,6 +393,9 @@ pub async fn execute_command(
             )),
             duration_secs: None,
             sudo_wrapper_applied: None,
+            status: None,
+            input_hint: None,
+            note: None,
         });
     }
 
@@ -338,6 +486,10 @@ pub async fn execute_command(
     let mut truncated = false;
     let mut timed_out = false;
     let mut switched_to_async = false;
+    // Recent output used to detect prompts that block on stdin.
+    let mut input_tail: Vec<u8> = Vec::new();
+    let mut input_hint: Option<String> = None;
+    let mut last_output_at = start_time;
 
     // Channel for receiving output from reader task
     #[derive(Debug)]
@@ -418,6 +570,26 @@ pub async fn execute_command(
                 let output_str = String::from_utf8_lossy(&data).to_string();
                 job_manager.append_output(&job_id, &output_str, preview_byte_limit);
 
+                // A trailing prompt means the command is likely blocked on stdin: surface
+                // that explicitly instead of leaving the caller with a silent wait.
+                append_to_input_tail(&mut input_tail, &data);
+                let idle = last_output_at.elapsed().as_secs_f64();
+                last_output_at = Instant::now();
+                if let Some(hint) = detect_input_prompt(&input_tail) {
+                    if let Ok(None) = child.try_wait() {
+                        tracing::info!(
+                            "Command waiting for input: job_id={}, idle={:.2}s, hint={:?}",
+                            job_id,
+                            idle,
+                            hint
+                        );
+                        job_manager.mark_waiting_input(&job_id, &hint);
+                        input_hint = Some(hint);
+                        switched_to_async = true;
+                        break;
+                    }
+                }
+
                 // Send streaming notification if peer is available
                 if let Some(ref peer) = peer {
                     let _ = peer
@@ -454,6 +626,11 @@ pub async fn execute_command(
                     tracing::debug!("Main task: child process exited, job_id={}", job_id);
                     break;
                 }
+                tracing::trace!(
+                    "No new output for {:.2}s, job_id={}",
+                    last_output_at.elapsed().as_secs_f64(),
+                    job_id
+                );
                 continue;
             }
         }
@@ -482,6 +659,7 @@ pub async fn execute_command(
             let _keep_master_alive = pair_master;
             tracing::debug!("Background task started for job_id={}", job_id_clone);
             let start_bg = Instant::now();
+            let mut bg_input_tail: Vec<u8> = Vec::new();
 
             // Continue receiving from the reader task channel
             loop {
@@ -504,6 +682,13 @@ pub async fn execute_command(
                             &output_str,
                             preview_byte_limit,
                         );
+                        // New output means the previous prompt was answered (or output
+                        // continued); re-evaluate the new tail without stopping the job.
+                        job_manager_clone.clear_waiting_input(&job_id_clone);
+                        append_to_input_tail(&mut bg_input_tail, &data);
+                        if let Some(hint) = detect_input_prompt(&bg_input_tail) {
+                            job_manager_clone.mark_waiting_input(&job_id_clone, &hint);
+                        }
                     }
                     Ok(Some(ReadMsg::Eof)) => {
                         // Process finished
@@ -592,6 +777,9 @@ pub async fn execute_command(
             } else {
                 None
             },
+            status: input_hint.as_ref().map(|_| "WaitingForInput".to_string()),
+            note: input_hint.as_deref().map(waiting_input_note),
+            input_hint,
         });
     }
 
@@ -679,6 +867,9 @@ pub async fn execute_command(
         } else {
             None
         },
+        status: None,
+        input_hint: None,
+        note: None,
     })
 }
 
@@ -715,6 +906,9 @@ async fn execute_command_inner(
             )),
             duration_secs: None,
             sudo_wrapper_applied: None,
+            status: None,
+            input_hint: None,
+            note: None,
         });
     }
 
@@ -805,6 +999,10 @@ async fn execute_command_inner(
     let mut truncated = false;
     let mut timed_out = false;
     let mut switched_to_async = false;
+    // Recent output used to detect prompts that block on stdin.
+    let mut input_tail: Vec<u8> = Vec::new();
+    let mut input_hint: Option<String> = None;
+    let mut last_output_at = start_time;
 
     // Channel for receiving output from reader task
     #[derive(Debug)]
@@ -885,6 +1083,26 @@ async fn execute_command_inner(
                 let output_str = String::from_utf8_lossy(&data).to_string();
                 job_manager.append_output(&job_id, &output_str, preview_byte_limit);
 
+                // A trailing prompt means the command is likely blocked on stdin: surface
+                // that explicitly instead of leaving the caller with a silent wait.
+                append_to_input_tail(&mut input_tail, &data);
+                let idle = last_output_at.elapsed().as_secs_f64();
+                last_output_at = Instant::now();
+                if let Some(hint) = detect_input_prompt(&input_tail) {
+                    if let Ok(None) = child.try_wait() {
+                        tracing::info!(
+                            "Command waiting for input: job_id={}, idle={:.2}s, hint={:?}",
+                            job_id,
+                            idle,
+                            hint
+                        );
+                        job_manager.mark_waiting_input(&job_id, &hint);
+                        input_hint = Some(hint);
+                        switched_to_async = true;
+                        break;
+                    }
+                }
+
                 // Send streaming notification if peer is available
                 if let Some(ref peer) = peer {
                     let _ = peer
@@ -921,6 +1139,11 @@ async fn execute_command_inner(
                     tracing::debug!("Main task: child process exited, job_id={}", job_id);
                     break;
                 }
+                tracing::trace!(
+                    "No new output for {:.2}s, job_id={}",
+                    last_output_at.elapsed().as_secs_f64(),
+                    job_id
+                );
                 continue;
             }
         }
@@ -949,6 +1172,7 @@ async fn execute_command_inner(
             let _keep_master_alive = pair_master;
             tracing::debug!("Background task started for job_id={}", job_id_clone);
             let start_bg = Instant::now();
+            let mut bg_input_tail: Vec<u8> = Vec::new();
 
             // Continue receiving from the reader task channel
             loop {
@@ -971,6 +1195,13 @@ async fn execute_command_inner(
                             &output_str,
                             preview_byte_limit,
                         );
+                        // New output means the previous prompt was answered (or output
+                        // continued); re-evaluate the new tail without stopping the job.
+                        job_manager_clone.clear_waiting_input(&job_id_clone);
+                        append_to_input_tail(&mut bg_input_tail, &data);
+                        if let Some(hint) = detect_input_prompt(&bg_input_tail) {
+                            job_manager_clone.mark_waiting_input(&job_id_clone, &hint);
+                        }
                     }
                     Ok(Some(ReadMsg::Eof)) => {
                         // Process finished
@@ -1092,6 +1323,9 @@ async fn execute_command_inner(
             } else {
                 None
             },
+            status: input_hint.as_ref().map(|_| "WaitingForInput".to_string()),
+            note: input_hint.as_deref().map(waiting_input_note),
+            input_hint,
         });
     }
 
@@ -1174,6 +1408,9 @@ async fn execute_command_inner(
         } else {
             None
         },
+        status: None,
+        input_hint: None,
+        note: None,
     })
 }
 
@@ -1567,4 +1804,66 @@ async fn maybe_start_sudo_keepalive(
         }
     });
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn newline_terminated_output_is_not_a_prompt() {
+        assert_eq!(detect_input_prompt(b"Done.\n"), None);
+        assert_eq!(detect_input_prompt(b"Continue? \r\n"), None);
+    }
+
+    #[test]
+    fn detects_trailing_prompt_markers() {
+        assert_eq!(
+            detect_input_prompt(b"Overwrite file? "),
+            Some("Overwrite file?".to_string())
+        );
+        assert_eq!(
+            detect_input_prompt(b"Username: "),
+            Some("Username:".to_string())
+        );
+        assert_eq!(
+            detect_input_prompt(b"PS C:\\Users\\me> "),
+            Some("PS C:\\Users\\me>".to_string())
+        );
+    }
+
+    #[test]
+    fn detects_credential_and_choice_prompts() {
+        assert_eq!(
+            detect_input_prompt(b"\x1b[1mPassword:\x1b[0m "),
+            Some("Password:".to_string())
+        );
+        assert_eq!(
+            detect_input_prompt(b"Enter passphrase: "),
+            Some("Enter passphrase:".to_string())
+        );
+        assert_eq!(
+            detect_input_prompt(b"Proceed? [y/n] "),
+            Some("Proceed? [y/n]".to_string())
+        );
+        assert_eq!(
+            detect_input_prompt(b"Press any key to continue "),
+            Some("Press any key to continue".to_string())
+        );
+    }
+
+    #[test]
+    fn plain_output_is_not_a_prompt() {
+        assert_eq!(detect_input_prompt(b"compiling 12 crates"), None);
+        assert_eq!(detect_input_prompt(b""), None);
+    }
+
+    #[test]
+    fn tail_keeps_only_the_last_bytes() {
+        let mut tail = Vec::new();
+        append_to_input_tail(&mut tail, &vec![b'a'; 300]);
+        append_to_input_tail(&mut tail, b"\nDone? ");
+        assert_eq!(tail.len(), INPUT_TAIL_BYTES);
+        assert_eq!(detect_input_prompt(&tail), Some("Done?".to_string()));
+    }
 }

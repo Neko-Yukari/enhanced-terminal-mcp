@@ -3,4 +3,6 @@ pub mod job_manager;
 pub mod terminal_executor;
 
 pub use job_manager::{JobManager, JobStatus};
-pub use terminal_executor::{TerminalExecutionInput, execute_command, preview_output};
+pub use terminal_executor::{
+    TerminalExecutionInput, execute_command, is_credential_hint, preview_output,
+};
