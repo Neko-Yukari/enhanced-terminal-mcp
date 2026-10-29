@@ -1,9 +1,9 @@
 use crate::detection::{detect_binaries, detect_shells};
-use crate::tools::{JobManager, TerminalExecutionInput, default_shell, execute_command, preview_output};
+use crate::tools::{ReadDirection, ReadSpec, select_page, JobSearchInput, search_job, JobManager, TerminalExecutionInput, default_shell, execute_command};
 use chrono::{SecondsFormat, Utc};
 use rmcp::{
-    ErrorData as McpError, Peer, handler::server::router::tool::ToolRouter,
-    handler::server::wrapper::Parameters, model::*, service::RoleServer, tool, tool_handler,
+    ErrorData as McpError, handler::server::router::tool::ToolRouter,
+    handler::server::wrapper::Parameters, model::*, service::{RequestContext, RoleServer}, tool, tool_handler,
     tool_router,
 };
 use schemars::JsonSchema;
@@ -120,12 +120,12 @@ pub struct JobStatusInput {
     /// If true, return only new output since last check (default: true)
     #[serde(default = "default_incremental")]
     pub incremental: bool,
-    /// Offset for pagination in bytes (default: 0)
+    /// Explicit 0-based stored UTF-8 byte start; even 0 means positioned reading, not incremental.
     #[serde(default)]
-    pub offset_bytes: usize,
-    /// Limit for pagination in bytes (default: 0 = all remaining)
+    pub offset_bytes: Option<usize>,
+    /// Explicit byte count (0 = all remaining); omit for the normal incremental mode.
     #[serde(default)]
-    pub limit_bytes: usize,
+    pub limit_bytes: Option<usize>,
     /// Maximum number of GPT-5/o200k_base tokens to return from the selected output chunk.
     /// Defaults to 4096. Set to 0 to disable token truncation.
     #[serde(default = "default_preview_tokens")]
@@ -133,6 +133,18 @@ pub struct JobStatusInput {
     /// If true, include the full command. Defaults to false to keep repeated polling compact.
     #[serde(default)]
     pub full_command: bool,
+    /// Explicit head/tail read, without moving the shared incremental cursor.
+    #[serde(default)]
+    pub direction: Option<ReadDirection>,
+    /// 1-based stored LF-delimited line to begin reading; do not mix with byte selectors.
+    #[serde(default)]
+    pub start_line: Option<usize>,
+    /// Positive number of lines, from start_line/head or the end in tail mode.
+    #[serde(default)]
+    pub line_count: Option<usize>,
+    /// Exclusive 0-based byte end for tail continuation; defaults to snapshot end.
+    #[serde(default)]
+    pub before_byte: Option<usize>,
 }
 
 fn default_incremental() -> bool {
@@ -232,12 +244,12 @@ impl EnhancedTerminalServer {
         description = "Execute shell commands in a PTY with smart async switching and security.
 
 PARAMETERS:
-- command (string, required): The shell command to execute
+- command (string): Shell command; supply either command or program, not both\n- program (string): Native executable path/name, launched directly without a shell\n- args (string array): Exact program arguments; preserves empty strings and quotes
 - cwd (string, default: '.'): Working directory for command execution; when omitted, '.' is resolved from the MCP server process working directory set by the caller/client
-- shell (string, default: 'bash'): Shell to use from available shells (see below)
-- preview_tokens (number, default: 4096): Maximum GPT-5/o200k_base tokens to return in the initial output preview; set 0 to disable token truncation
-- env_vars (object, default: {}): Environment variables to set (e.g. {\"PATH\": \"/usr/bin\", \"DEBUG\": \"true\"})
-- force_sync (boolean, default: false): Force synchronous execution regardless of duration
+- shell (string, default: Windows 'pwsh', other platforms 'bash'): Shell to use from available shells (see below)
+- preview_tokens (number, default: 4096): Maximum GPT-5/o200k_base tokens in the initial preview; 0 disables token truncation\n- direction (head or tail, default: head): Which end of the captured preview to show; tail is in normal order
+- env_vars (object, default: {}): Environment variables to set; GIT_PAGER and PAGER default to cat unless explicitly supplied
+- force_sync (boolean, default: false): Wait up to 60 seconds before returning a background job; commands keep running
 - force_async (boolean, default: false): Force immediate background execution and return a job_id without waiting for the async threshold
 - custom_denylist (array, default: []): Additional dangerous patterns to block
 - tags (array, default: []): Optional tags for categorizing jobs (e.g., [\"build\", \"ci\"])
@@ -247,7 +259,7 @@ AVAILABLE SHELLS:
 
 BEHAVIOR:
 - Commands running longer than 50 seconds automatically switch to background (keeps running)
-  (configurable via ENHANCED_TERMINAL_ASYNC_THRESHOLD_SECS environment variable)
+  (configurable via ENHANCED_TERMINAL_ASYNC_THRESHOLD_SECS, capped at 60 seconds including force_sync)
 - Set force_async=true to immediately return a job_id for interactive commands that need stdin
 - No timeout by default - commands run until completion
   (configurable via ENHANCED_TERMINAL_TIMEOUT_SECS environment variable)
@@ -279,7 +291,7 @@ RETURNS:
     async fn enhanced_terminal(
         &self,
         Parameters(input): Parameters<TerminalExecutionInput>,
-        peer: Peer<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         log_enhanced_terminal_call(&input).map_err(|e| {
             McpError::internal_error(format!("Failed to log enhanced_terminal call: {}", e), None)
@@ -293,7 +305,7 @@ RETURNS:
         }
 
         // Validate shell against detected shells
-        if !self.detected_shells.is_empty() && !self.detected_shells.contains(&input.shell) {
+        if input.program.is_none() && !self.detected_shells.is_empty() && !self.detected_shells.contains(&input.shell) {
             return Err(McpError::invalid_params(
                 format!(
                     "Shell '{}' not found. Available shells: {}",
@@ -304,7 +316,7 @@ RETURNS:
             ));
         }
 
-        let result = execute_command(&input, &self.job_manager, Some(peer))
+        let result = execute_command(&input, &self.job_manager, context)
             .await
             .map_err(|e| {
                 McpError::internal_error(format!("Command execution failed: {}", e), None)
@@ -323,6 +335,7 @@ RETURNS:
 
         let mut result_text = format!("Job ID: {}\n", result.job_id);
         result_text.push_str(&format!("Command: {}\n", result.command));
+        result_text.push_str(&format!("Truncated: {}\nPreview Direction: {}\n", result.truncated, input.direction.name()));
         result_text.push_str(&format!(
             "Working Directory: {}\n",
             result.working_directory
@@ -372,229 +385,84 @@ RETURNS:
             }
         }
 
+        if result.truncated {
+            result_text.push_str(&format!(
+                "\nRead complete output in pages: enhanced_terminal_job_status({{\"job_id\":\"{}\",\"offset_bytes\":0,\"limit_bytes\":4096,\"preview_tokens\":0}})\n",
+                result.job_id,
+            ));
+        }
         Ok(CallToolResult::success(vec![Content::text(result_text)]))
     }
 
     #[tool(
         name = "enhanced_terminal_job_status",
-        description = "Get status and output of a background job.
-
-PARAMETERS:
-- job_id (string, required): The readable adjective-noun-number job identifier returned by enhanced_terminal
-- incremental (boolean, default: true): If true, return only new output since last check (RECOMMENDED)
-- offset_bytes (number, default: 0): Starting byte position for pagination
-- limit_bytes (number, default: 0): Maximum bytes to select for pagination (0 = all remaining)
-- preview_tokens (number, default: 4096): Maximum GPT-5/o200k_base tokens to return from the selected output chunk; set 0 to disable token truncation
-- full_command (boolean, default: false): Include the full command; by default job_status returns only the command summary to keep polling compact
-
-BEHAVIOR:
-- Returns current status: Running, Completed, Failed, TimedOut, or Canceled
-- Full output is available through pagination; preview_tokens can bound the returned text for model context
-- Incremental mode tracks read position per job
-- Duration calculated from start time
-- Exit code available when completed
-- Supports three output modes: incremental, full, and paginated
-
-INCREMENTAL OUTPUT (DEFAULT):
-When incremental=true (default, recommended):
-- First call returns all output accumulated so far
-- Subsequent calls return only new output since last check
-- Read position maintained per job_id
-- Efficient for polling long-running jobs
-- More responsive than full output mode
-- Reset position by calling with incremental=false to get all output again
-
-PAGINATION MODE:
-When offset_bytes > 0 or limit_bytes > 0:
-- Returns specific byte range of output
-- offset_bytes: Starting position in bytes
-- limit_bytes: Number of bytes to select before optional token previewing (0 = all remaining)
-- Returns has_more flag indicating if more data available
-- Returns total_length for overall output size
-- Useful for seeking into very long logs
-- Can re-read specific segments without full retrieval
-
-RETURNS:
-- job_id: Readable adjective-noun-number job identifier
-- command: Full executed command, only present when full_command=true
-- summary: Short command summary returned by default
-- shell: Shell used for execution
-- cwd: Working directory
-- status: Current job status (Running, Completed, Failed, TimedOut, Canceled)
-- exit_code: Exit code (if completed)
-- pid: Process ID (if available)
-- duration: Time elapsed since job start
-- tags: Optional tags assigned to job
-- output: Command output (full, incremental, or paginated based on parameters, optionally token-previewed)
-- truncated: Boolean indicating if output preview was truncated
-- (pagination only) has_more: Boolean indicating if more data available
-- (pagination only) total_length: Total output size in bytes
-- (pagination only) next_offset_bytes: Byte offset to pass to the next call"
+        description = "Read the stored raw UTF-8 PTY transcript, preserving ANSI/repaint sequences. Default is incremental forward reading with the original 4096-token budget. Explicit direction=head/tail, start_line/line_count (1-based LF lines), or offset_bytes/limit_bytes (0-based bytes, exclusive end) never move that cursor. Tail displays text in normal forward order; before_byte anchors backward continuation. Do not mix line and byte positioning. Large lines are split by the requested preview budget: returned raw byte/line ranges, partial_line flags and Continue Selection arguments locate every segment. preview_tokens=0 disables the token limit; explicit byte limits still apply. CRLF counts as one line break; terminal cursor movement is not interpreted."
     )]
     async fn job_status(
         &self,
         Parameters(input): Parameters<JobStatusInput>,
     ) -> Result<CallToolResult, McpError> {
-        // Determine if pagination is requested
-        let use_pagination = input.offset_bytes > 0 || input.limit_bytes > 0;
+        let job = self.job_manager.get_job(&input.job_id)
+            .ok_or_else(|| McpError::invalid_params("Job not found", None))?;
+        let page = select_page(&job.full_output, &ReadSpec {
+            direction: input.direction, offset_bytes: input.offset_bytes, limit_bytes: input.limit_bytes,
+            before_byte: input.before_byte, start_line: input.start_line, line_count: input.line_count,
+            cursor: if input.incremental { job.last_read_position } else { 0 }, preview_tokens: input.preview_tokens,
+        }).map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+        if input.incremental && !page.explicit { self.job_manager.set_read_position(&input.job_id, page.end); }
+        let tail = page.direction == ReadDirection::Tail;
+        let has_more = if tail { page.start > 0 } else { page.end < job.full_output.len() };
+        let continuation = if page.selection_has_more {
+            Some(if tail { serde_json::json!({ "job_id": job.job_id, "direction": "tail", "before_byte": page.start,
+                "limit_bytes": page.start - page.selection_start, "preview_tokens": input.preview_tokens }) }
+            else { serde_json::json!({ "job_id": job.job_id, "offset_bytes": page.end,
+                "limit_bytes": page.selection_end - page.end, "preview_tokens": input.preview_tokens }) })
+        } else { None };
 
-        let mut range_start_byte = None;
-        let mut range_end_byte = None;
-        let mut requested_end_byte = None;
-        let mut next_offset_bytes = None;
-
-        let (mut output_to_show, has_more, total_length) = if use_pagination {
-            // Use byte-explicit pagination
-            let limit_bytes = if input.limit_bytes == 0 {
-                usize::MAX
-            } else {
-                input.limit_bytes
-            };
-
-            let range = self
-                .job_manager
-                .get_output_range(&input.job_id, input.offset_bytes, limit_bytes)
-                .ok_or_else(|| {
-                    McpError::invalid_params("Job not found", None::<serde_json::Value>)
-                })?;
-
-            range_start_byte = Some(range.start_byte);
-            range_end_byte = Some(range.end_byte);
-            requested_end_byte = Some(range.requested_end_byte);
-            next_offset_bytes = range.next_offset_bytes;
-
-            (
-                range.output,
-                Some(range.has_more),
-                Some(range.total_len_bytes),
-            )
-        } else if input.incremental {
-            // Get incremental output
-            let (new_output, is_running) = self
-                .job_manager
-                .get_incremental_output(&input.job_id)
-                .ok_or_else(|| {
-                McpError::invalid_params("Job not found", None::<serde_json::Value>)
-            })?;
-
-            if new_output.is_empty() && !is_running {
-                return Ok(CallToolResult::success(vec![Content::text(format!(
-                    "Job {} has no new output. Status: Completed.\nUse incremental=false to see all output.",
-                    input.job_id
-                ))]));
-            }
-
-            (new_output, None, None)
-        } else {
-            // Get full output
-            let job = self.job_manager.get_job(&input.job_id).ok_or_else(|| {
-                McpError::invalid_params("Job not found", None::<serde_json::Value>)
-            })?;
-            (job.output.clone(), None, None)
-        };
-
-        // Always get current job info for metadata
-        let job = self
-            .job_manager
-            .get_job(&input.job_id)
-            .ok_or_else(|| McpError::invalid_params("Job not found", None::<serde_json::Value>))?;
-
-        let mut result_text = format!("Job ID: {}\n", job.job_id);
-        result_text.push_str(&format!("Summary: {}\n", job.summary));
-        if input.full_command {
-            result_text.push_str(&format!("Command: {}\n", job.command));
-        }
-        result_text.push_str(&format!("Shell: {}\n", job.shell));
-        result_text.push_str(&format!("Working Directory: {}\n", job.cwd));
-        result_text.push_str(&format!("Status: {:?}\n", job.status));
-
-        if !job.tags.is_empty() {
-            result_text.push_str(&format!("Tags: {}\n", job.tags.join(", ")));
-        }
-
-        // Use the duration helper method
-        result_text.push_str(&format!("Duration: {}\n", job.duration_string()));
-
-        if let Some(exit_code) = job.exit_code {
-            result_text.push_str(&format!("Exit Code: {}\n", exit_code));
-        }
-
-        if let Some(pid) = job.pid {
-            result_text.push_str(&format!("PID: {}\n", pid));
-        }
-
-        let token_preview = if input.preview_tokens > 0 {
-            let preview = preview_output(&output_to_show, input.preview_tokens);
-            output_to_show = preview.text.clone();
-            Some(preview)
-        } else {
-            None
-        };
-
-        if use_pagination {
-            result_text.push_str(&format!(
-                "Output Mode: Paginated (offset_bytes: {}, limit_bytes: {})\n",
-                input.offset_bytes,
-                if input.limit_bytes == 0 {
-                    "all".to_string()
-                } else {
-                    input.limit_bytes.to_string()
-                }
-            ));
-            if let Some(total) = total_length {
-                result_text.push_str(&format!("Total Output Length: {} bytes\n", total));
-            }
-            if let (Some(start), Some(end), Some(requested_end)) =
-                (range_start_byte, range_end_byte, requested_end_byte)
-            {
-                result_text.push_str(&format!(
-                    "Returned Byte Range: {}..{} (requested end: {})\n",
-                    start, end, requested_end
-                ));
-            }
-            if let Some(more) = has_more {
-                result_text.push_str(&format!("Has More: {}\n", more));
-            }
-            if let Some(next) = next_offset_bytes {
-                result_text.push_str(&format!("Next Offset Bytes: {}\n", next));
-            }
-        } else if input.incremental {
-            result_text.push_str(&format!(
-                "Output Mode: Incremental (new since last check)\n"
-            ));
-        } else {
-            result_text.push_str(&format!("Output Mode: Full\n"));
-        }
-
-        if let Some(ref preview) = token_preview {
-            result_text.push_str(&format!(
-                "Preview Tokens: {} / {} ({})\n",
-                preview.tokens.unwrap_or(0),
-                preview.token_limit.unwrap_or(0),
-                preview.tokenizer.unwrap_or("unknown")
-            ));
-            if preview.truncated {
-                result_text.push_str("Token Preview Truncated: true\n");
-            }
-        }
-
+        let mut result_text = format!(
+            "Job ID: {}\nSummary: {}\nShell: {}\nWorking Directory: {}\nStatus: {:?}\nDuration: {}\n",
+            job.job_id, job.summary, job.shell, job.cwd, job.status, job.duration_string(),
+        );
+        if input.full_command { result_text.push_str(&format!("Command: {}\n", job.command)); }
+        if let Some(code) = job.exit_code { result_text.push_str(&format!("Exit Code: {}\n", code)); }
+        if let Some(pid) = job.pid { result_text.push_str(&format!("PID: {}\n", pid)); }
+        if !job.tags.is_empty() { result_text.push_str(&format!("Tags: {}\n", job.tags.join(", "))); }
+        result_text.push_str(&format!(
+            "Output Mode: {}\nDirection: {}\nTotal Output Length: {} bytes\nTotal Lines: {}\nReturned Byte Range: {}..{}\nHas More: {}\nTruncated: {}\n",
+            if page.explicit { "Explicit" } else if input.incremental { "Incremental" } else { "Full" },
+            page.direction.name(), job.full_output.len(), page.total_lines, page.start, page.end, has_more, page.selection_has_more,
+        ));
+        let line_range = page.first_line.zip(page.last_line).map(|(first,last)| format!("{first}..{last}")).unwrap_or_else(|| "none".to_string());
+        result_text.push_str(&format!("Returned Line Range: {}\nPartial Line: {}\n", line_range, page.partial_start || page.partial_end));
+        let metadata = serde_json::json!({ "view": "stored_utf8_raw_pty_transcript", "byte_base": 0, "byte_end_exclusive": true,
+            "line_base": 1, "line_delimiter": "LF (CRLF is one break)", "line_start": page.first_line, "line_end": page.last_line,
+            "partial_line": page.partial_start || page.partial_end, "partial_start": page.partial_start, "partial_end": page.partial_end,
+            "selection_start_byte": page.selection_start, "selection_end_byte": page.selection_end,
+            "selection_has_more": page.selection_has_more, "continue": continuation });
+        result_text.push_str(&format!("Read Metadata: {}\n", metadata));
+        if input.preview_tokens > 0 { result_text.push_str(&format!("Preview Tokens: {} / {} (o200k_base)\n", page.tokens.unwrap_or(0), input.preview_tokens)); }
+        if page.end < job.full_output.len() { result_text.push_str(&format!("Next Offset Bytes: {}\n", page.end)); }
+        if tail && page.start > 0 { result_text.push_str(&format!("Previous Before Byte: {}\n", page.start)); }
+        if let Some(args) = continuation { result_text.push_str(&format!("Continue Selection: {}\n", args)); }
         result_text.push_str("\nOutput:\n");
-        result_text.push_str(&output_to_show);
-
-        if job.truncated && !input.incremental && !use_pagination {
-            result_text.push_str("\n\n[Output truncated - showing first part only]");
-        }
-
-        if use_pagination && has_more == Some(true) {
-            if let Some(next) = next_offset_bytes {
-                result_text.push_str(&format!(
-                    "\n\n[More output available. Next offset_bytes: {}]",
-                    next
-                ));
-            }
-        }
-
+        result_text.push_str(&page.text);
+        // Coordinates and continuation live in the header, never inside raw program output.
         Ok(CallToolResult::success(vec![Content::text(result_text)]))
+    }
+
+    #[tool(
+        name = "enhanced_terminal_job_search",
+        description = "Search only one job's complete stored UTF-8 PTY transcript. mode=literal uses rg fixed strings (default); regex uses rg; semantic uses the existing local sgrep text model offline, without a persistent index. No unrelated files are searched. Results include raw transcript byte offsets, line ranges, explicitly bounded context and concrete job_status readback arguments. ANSI and repaint sequences are preserved: this is a raw transcript view, not clean stdout. Search does not move the incremental cursor or change the original 4096-token preview default."
+    )]
+    async fn job_search(
+        &self,
+        Parameters(input): Parameters<JobSearchInput>,
+    ) -> Result<CallToolResult, McpError> {
+        let result = search_job(&self.job_manager, &input).await
+            .map_err(|error| McpError::internal_error(format!("Job search failed: {error:#}"), None))?;
+        let text = serde_json::to_string(&result)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        Ok(CallToolResult::success(vec![Content::text(text)]))
     }
 
     #[tool(
@@ -716,7 +584,7 @@ RETURNS: List of jobs with:
 
     #[tool(
         name = "enhanced_terminal_job_cancel",
-        description = "Cancel a running background job by sending SIGTERM (Unix only).
+        description = "Cancel a running job: terminate its owned process tree on Windows; send SIGTERM on Unix.
 
 PARAMETERS:
 - job_id (string, required): The readable adjective-noun-number job identifier to cancel
@@ -729,7 +597,7 @@ BEHAVIOR:
 
 PLATFORM SUPPORT:
 - Unix/Linux/macOS: Full support with SIGTERM
-- Windows: Limited support (status update only, no signal)
+- Windows: Terminates the job-owned process group and confirms exit before reporting Canceled
 
 RETURNS:
 - Confirmation message with job_id
@@ -858,7 +726,7 @@ RETURNS: JSON array of binaries with:
             "binaries": reports
         });
 
-        let json_text = serde_json::to_string_pretty(&json_output)
+        let json_text = serde_json::to_string(&json_output)
             .map_err(|e| McpError::internal_error(format!("Serialization error: {}", e), None))?;
 
         Ok(CallToolResult::success(vec![Content::text(json_text)]))
@@ -869,112 +737,19 @@ RETURNS: JSON array of binaries with:
 impl rmcp::ServerHandler for EnhancedTerminalServer {
     fn get_info(&self) -> ServerInfo {
         let instructions = format!(
-            "Enhanced Terminal MCP Server - Production-ready command execution with job management.\n\
-            \n\
-            CORE FEATURES:\n\
-            • Smart async switching: Commands auto-background after 50s (configurable)\n\
-            • Job management: Full tracking, status, output notifications, stdin, cancellation\n\
-            • Security: 40+ dangerous patterns blocked by default\n\
-            • Performance: 16 concurrent binary detection checks\n\
-            • Environment: Full env var support, PTY terminal emulation\n\
-            • Audit trail: enhanced_terminal calls are appended to enhanced_terminal_calls.jsonl\n\
-            \n\
-            TOOLS:\n\
-            \n\
-            1. enhanced_terminal - Execute shell commands\n\
-               • Default shell: {}\n\
-               • Available shells: {}\n\
-               • Smart async: Auto-background after 50s (ENHANCED_TERMINAL_ASYNC_THRESHOLD_SECS env var)\n\
-               • Force async: Set force_async=true to immediately get a job_id for stdin-capable interactive jobs\n\
-               • No timeout by default (ENHANCED_TERMINAL_TIMEOUT_SECS env var)\n\
-               • Environment variables: Set via env_vars parameter\n\
-               • Security: Denylist blocks rm -rf /, shutdown, fork bombs, etc.\n\
-               • Output: token-bounded previews, captured incrementally\n\
-               • Returns: readable adjective-noun-number job_id for tracking background execution\n\
-            \n\
-            2. enhanced_terminal_job_status - Monitor background jobs\n\
-               • Get current status: Running, Completed, Failed, TimedOut, Canceled\n\
-               • Output modes: Incremental (default, new since last check) or Full (all output)\n\
-               • Incremental mode is default and recommended for efficiency\n\
-               • Set incremental=false to get all output from start\n\
-               • Returns: status, exit_code, duration, output, PID\n\
-            \n\
-            3. enhanced_terminal_job_list - List all jobs\n\
-               • Shows recent jobs (newest first)\n\
-               • Configurable limit (default: 50)\n\
-               • Quick overview with output previews\n\
-               • Filter by status if needed\n\
-            \n\
-            4. enhanced_terminal_job_cancel - Cancel running jobs\n\
-               • Sends SIGTERM (Unix/Linux/macOS only)\n\
-               • Graceful process termination\n\
-               • Updates job status to Canceled\n\
-            \n\
-            5. enhanced_terminal_job_stdin - Send input to running jobs\n\
-               • Writes exact UTF-8 text to a job's PTY stdin\n\
-               • Include \\n in input to submit a line; no newline is appended automatically\n\
-               • Useful for prompts after a command switches to background\n\
-            \n\
-            6. detect_binaries - Fast tool detection\n\
-               • Scans 190+ developer tools across 26 categories\n\
-               • 16 concurrent checks by default\n\
-               • Filter by category for targeted detection\n\
-               • Returns: paths, versions, availability\n\
-            \n\
-            SMART ASYNC:\n\
-            Commands exceeding 50 seconds automatically move to background (configurable via\n\
-            ENHANCED_TERMINAL_ASYNC_THRESHOLD_SECS environment variable, defaults to 50).\n\
-            Returns immediately with a readable adjective-noun-number job_id. Use enhanced_terminal_job_status with incremental=true to poll for updates, and enhanced_terminal_job_stdin to send input to prompts.\n\
-            Set force_sync=true to wait for completion regardless of duration, or force_async=true to return a job_id immediately.\n\
-            \n\
-            ENVIRONMENT VARIABLES:\n\
-            Set environment variables via env_vars parameter:\n\
-            {{\"PATH\": \"/custom/path\", \"DEBUG\": \"true\", \"NODE_ENV\": \"production\"}}\n\
-            enhanced_terminal call log path can be overridden with ENHANCED_TERMINAL_CALL_LOG_PATH.\n\
-            \n\
-            SECURITY DENYLIST:\n\
-            Blocks dangerous patterns (40+ default):\n\
-            • Destructive: rm -rf /, mkfs, dd if=/dev/zero, > /dev/sda\n\
-            • System: shutdown, reboot, halt, chmod 777 /, chown -R root\n\
-            • Exhaustion: fork bombs (:(){{:|:&}};:), infinite loops\n\
-            • Kernel: rmmod, insmod, modprobe\n\
-            • Cron: crontab -r\n\
-            • Custom patterns: Add via custom_denylist parameter\n\
-            \n\
-            INCREMENTAL OUTPUT (DEFAULT):\n\
-            enhanced_terminal_job_status uses incremental mode by default (recommended):\n\
-            • First call: Returns all output accumulated so far\n\
-            • Subsequent calls: Only new output since last check\n\
-            • Efficient polling for long-running jobs\n\
-            • More responsive than full output mode\n\
-            • Set incremental=false to get full output from start\n\
-            \n\
-            AVAILABLE SHELLS:\n\
-            {}\n\
-            \n\
-            BINARY CATEGORIES:\n\
-            package_managers, rust_tools, python_tools, build_systems, c_cpp_tools,\n\
-            java_jvm_tools, maven_tools, node_js_tools, go_tools, editors_dev,\n\
-            search_productivity, system_perf, containers, networking, security, auth_helpers,\n\
-            databases, vcs, cloud_cli, iac_tools, media_tools, ai_ml_tools,\n\
-            docs_tools, ruby_tools, dotnet_tools, cad_utils (26 categories total)\n\
-            \n\
-            EXAMPLES:\n\
-            \n\
-            Quick command:\n\
-            {{\"command\": \"ls -la\", \"cwd\": \".\" }}\n\
-            \n\
-            Long-running with env vars:\n\
-            {{\"command\": \"npm install\", \"env_vars\": {{\"NODE_ENV\": \"production\"}}}}\n\
-            \n\
-            Monitor job:\n\
-            {{\"job_id\": \"brave-river-1\", \"incremental\": true}}\n\
-            \n\
-            Detect Python tools:\n\
-            {{\"filter_categories\": [\"python_tools\"], \"max_concurrency\": 16}}\n\
-            \n\
-            Extracted and adapted from the Zed editor project.",
-            default_shell(), self.shell_info, self.shell_info
+            "Prefer enhanced_terminal for ordinary commands, builds, background jobs and interactive tasks. \
+             Fall back to OpenCode native shell only when enhanced_terminal is unavailable, lacks a required capability, or has a confirmed compatibility issue; state the reason.\n\
+             Supply either shell command or native program with an args array; no shell translation. \
+             GIT_PAGER and PAGER default to cat; explicit env_vars override them. Foreground calls return a job ID within 60 seconds even with force_sync; the command keeps running in the background.\n\
+             For stdin, start force_async=true then call enhanced_terminal_job_stdin; include a newline to submit.\n\
+             Default shell: {}. Previews default to 4096 o200k tokens. \
+             Read head/tail or 1-based start_line/line_count; raw byte positions are 0-based with exclusive ends. Truncated output includes a job ID and readback call; follow returned byte offsets with preview_tokens=0 for exact pages. \
+             Full command is available via job_status full_command=true. \
+             job_search finds literal/regex (rg) or semantic (local sgrep) matches in one full transcript and returns byte readback references.\n\
+             Windows cancellation forcefully terminates the task-owned job; Unix uses SIGTERM. \
+             Output is a raw PTY transcript (ANSI/repaints possible), retained in memory until this server exits.\n\
+             {}",
+            default_shell(), self.shell_info,
         );
 
         ServerInfo {

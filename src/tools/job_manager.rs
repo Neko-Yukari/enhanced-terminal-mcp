@@ -65,6 +65,8 @@ pub struct JobManager {
     jobs: Arc<Mutex<HashMap<String, JobRecord>>>,
     job_counter: Arc<Mutex<u64>>,
     stdin_writers: Arc<Mutex<HashMap<String, PtyWriter>>>,
+    #[cfg(windows)]
+    windows_jobs: Arc<Mutex<HashMap<String, Arc<super::windows_job::WindowsJob>>>>,
 }
 
 fn floor_char_boundary(text: &str, mut index: usize) -> usize {
@@ -73,17 +75,6 @@ fn floor_char_boundary(text: &str, mut index: usize) -> usize {
         index -= 1;
     }
     index
-}
-
-#[derive(Debug, Clone)]
-pub struct OutputRange {
-    pub output: String,
-    pub has_more: bool,
-    pub total_len_bytes: usize,
-    pub start_byte: usize,
-    pub end_byte: usize,
-    pub requested_end_byte: usize,
-    pub next_offset_bytes: Option<usize>,
 }
 
 const JOB_ID_ADJECTIVES: &[&str] = &[
@@ -149,6 +140,8 @@ impl JobManager {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             job_counter: Arc::new(Mutex::new(1)),
             stdin_writers: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(windows)]
+            windows_jobs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -238,6 +231,19 @@ impl JobManager {
         }
     }
 
+    #[cfg(windows)]
+    pub fn attach_windows_job(&self, id: &str, child: &dyn portable_pty::Child) -> Result<()> {
+        let job = super::windows_job::WindowsJob::attach(child)?;
+        self.windows_jobs.lock().unwrap().insert(id.to_string(), Arc::new(job));
+        Ok(())
+    }
+
+    pub fn set_read_position(&self, id: &str, position: usize) {
+        if let Some(job) = self.jobs.lock().unwrap().get_mut(id) {
+            job.last_read_position = position.min(job.full_output.len());
+        }
+    }
+
     /// Attach a PTY stdin writer to a running job.
     pub fn attach_stdin_writer(&self, job_id: &str, writer: Box<dyn Write + Send>) {
         let mut writers = self.stdin_writers.lock().unwrap();
@@ -283,12 +289,17 @@ impl JobManager {
     /// Complete a job
     pub fn complete_job(&self, job_id: &str, exit_code: Option<i32>, status: JobStatus) {
         self.stdin_writers.lock().unwrap().remove(job_id);
+        #[cfg(windows)]
+        self.windows_jobs.lock().unwrap().remove(job_id);
 
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(job) = jobs.get_mut(job_id) {
-            job.finished_at = Some(SystemTime::now());
             job.exit_code = exit_code;
-            job.status = status;
+            // The reader may observe the termination after cancellation was confirmed.
+            if job.status != JobStatus::Canceled {
+                job.finished_at = Some(SystemTime::now());
+                job.status = status;
+            }
         }
     }
 
@@ -296,18 +307,6 @@ impl JobManager {
     pub fn get_job(&self, job_id: &str) -> Option<JobRecord> {
         let jobs = self.jobs.lock().unwrap();
         jobs.get(job_id).cloned()
-    }
-
-    /// Get incremental output (only new since last read)
-    pub fn get_incremental_output(&self, job_id: &str) -> Option<(String, bool)> {
-        let mut jobs = self.jobs.lock().unwrap();
-        if let Some(job) = jobs.get_mut(job_id) {
-            let new_output = job.full_output[job.last_read_position..].to_string();
-            job.last_read_position = job.full_output.len();
-            Some((new_output, matches!(job.status, JobStatus::Running)))
-        } else {
-            None
-        }
     }
 
     /// Reset read position to get all output again
@@ -386,46 +385,6 @@ impl JobManager {
         }
     }
 
-    /// Get output with byte-explicit pagination.
-    pub fn get_output_range(
-        &self,
-        job_id: &str,
-        offset_bytes: usize,
-        limit_bytes: usize,
-    ) -> Option<OutputRange> {
-        let jobs = self.jobs.lock().unwrap();
-        let job = jobs.get(job_id)?;
-
-        let total_len_bytes = job.full_output.len();
-        let requested_end_byte = if limit_bytes == usize::MAX {
-            total_len_bytes
-        } else {
-            offset_bytes
-                .saturating_add(limit_bytes)
-                .min(total_len_bytes)
-        };
-
-        let start_byte = floor_char_boundary(&job.full_output, offset_bytes);
-        let end_byte = floor_char_boundary(&job.full_output, requested_end_byte);
-        let output = if start_byte < total_len_bytes && start_byte <= end_byte {
-            job.full_output[start_byte..end_byte].to_string()
-        } else {
-            String::new()
-        };
-        let has_more = requested_end_byte < total_len_bytes;
-        let next_offset_bytes = has_more.then_some(requested_end_byte);
-
-        Some(OutputRange {
-            output,
-            has_more,
-            total_len_bytes,
-            start_byte,
-            end_byte,
-            requested_end_byte,
-            next_offset_bytes,
-        })
-    }
-
     /// Cancel a running job (Unix only)
     #[cfg(unix)]
     pub fn cancel_job(&self, job_id: &str) -> Result<()> {
@@ -460,29 +419,21 @@ impl JobManager {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     pub fn cancel_job(&self, job_id: &str) -> Result<()> {
-        let canceled = {
-            let mut jobs = self.jobs.lock().unwrap();
-            if let Some(job) = jobs.get_mut(job_id) {
-                if matches!(job.status, JobStatus::Running) {
-                    job.status = JobStatus::Canceled;
-                    job.finished_at = Some(SystemTime::now());
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
-
-        if canceled {
-            self.stdin_writers.lock().unwrap().remove(job_id);
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("Job not found or not running"))
+        if !self.get_job(job_id).is_some_and(|job| job.status == JobStatus::Running) {
+            anyhow::bail!("Job not found or not running");
         }
+        let job = self.windows_jobs.lock().unwrap().get(job_id).cloned()
+            .ok_or_else(|| anyhow::anyhow!("Job has no owned Windows process group"))?;
+        // Do not claim cancellation until every process in this job has exited.
+        job.terminate()?;
+        if let Some(record) = self.jobs.lock().unwrap().get_mut(job_id) {
+            record.status = JobStatus::Canceled;
+            record.finished_at = Some(SystemTime::now());
+        }
+        self.stdin_writers.lock().unwrap().remove(job_id);
+        Ok(())
     }
 
     /// Delete a job from history
@@ -513,6 +464,8 @@ impl Clone for JobManager {
             jobs: Arc::clone(&self.jobs),
             job_counter: Arc::clone(&self.job_counter),
             stdin_writers: Arc::clone(&self.stdin_writers),
+            #[cfg(windows)]
+            windows_jobs: Arc::clone(&self.windows_jobs),
         }
     }
 }

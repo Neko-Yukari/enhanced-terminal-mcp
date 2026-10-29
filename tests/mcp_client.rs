@@ -384,6 +384,151 @@ async fn enhanced_terminal_echo() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn git_diff_disables_default_pager() {
+    let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let directory = std::env::temp_dir().join(format!("terminal-pager-{}-{unique}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("before.txt"), "before\n").unwrap();
+    fs::write(directory.join("after.txt"), "after\n").unwrap();
+    let client = connect_child_client_with_env(&[("ENHANCED_TERMINAL_TIMEOUT_SECS", "3")]).await;
+    let result = tokio::time::timeout(Duration::from_secs(10), client.peer().call_tool(CallToolRequestParam {
+        name: Cow::Borrowed("enhanced_terminal"),
+        arguments: Some(serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+            "program": "git",
+            "args": ["--paginate", "-c", "core.pager=less", "diff", "--no-index", "--", "before.txt", "after.txt"],
+            "cwd": directory,
+            "force_sync": true,
+        })).unwrap()),
+    })).await.expect("git diff request never returned").expect("git diff call failed");
+    let text = text_from_calltool(result);
+    assert!(text.contains("+after"), "diff did not reach stdout: {text}");
+    assert!(!text.contains("Press RETURN") && !text.contains("TIMED OUT"), "pager blocked git diff: {text}");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forced_sync_returns_background_job_after_bounded_wait() {
+    let client = connect_child_client().await;
+    let command = if cfg!(windows) {
+        "Write-Output 'waiting-for-input'; $line = Read-Host; Write-Output ('received:' + $line)"
+    } else {
+        "printf 'waiting-for-input\n'; IFS= read -r line; printf 'received:%s\n' \"$line\""
+    };
+    let run = tokio::time::timeout(Duration::from_secs(70), client.peer().call_tool(CallToolRequestParam {
+        name: Cow::Borrowed("enhanced_terminal"),
+        arguments: Some(serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+            "command": command,
+            "shell": if cfg!(windows) { "pwsh" } else { "bash" },
+            "force_sync": true,
+        })).unwrap()),
+    })).await.expect("force_sync blocked past the foreground limit").expect("terminal call failed");
+    let text = text_from_calltool(run);
+    assert!(text.contains("SWITCHED TO BACKGROUND"), "request did not release its caller: {text}");
+    let job_id = text.lines().find_map(|line| line.strip_prefix("Job ID: ")).unwrap();
+    let input = client.peer().call_tool(CallToolRequestParam {
+        name: Cow::Borrowed("enhanced_terminal_job_stdin"),
+        arguments: Some(serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+            "job_id": job_id,
+            "input": "still-running\n",
+        })).unwrap()),
+    }).await.expect("background command did not retain stdin");
+    assert!(!input.is_error.unwrap_or(false));
+    for _ in 0..50 {
+        let status = client.peer().call_tool(CallToolRequestParam {
+            name: Cow::Borrowed("enhanced_terminal_job_status"),
+            arguments: Some(serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+                "job_id": job_id,
+                "incremental": false,
+            })).unwrap()),
+        }).await.expect("job status failed");
+        let status = text_from_calltool(status);
+        if status.contains("Status: Completed") {
+            assert!(status.contains("received:still-running"), "command lost its input: {status}");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("background command did not finish after stdin");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_request_terminates_foreground_job() {
+    use rmcp::model::{ClientRequest, Request};
+    use rmcp::service::PeerRequestOptions;
+
+    let client = connect_child_client().await;
+    let command = if cfg!(windows) {
+        "Write-Output 'cancel-ready'; $line = Read-Host"
+    } else {
+        "printf 'cancel-ready\n'; IFS= read -r line"
+    };
+    let handle = client.peer().send_cancellable_request(
+        ClientRequest::CallToolRequest(Request::new(CallToolRequestParam {
+            name: Cow::Borrowed("enhanced_terminal"),
+            arguments: Some(serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+                "command": command,
+                "shell": if cfg!(windows) { "pwsh" } else { "bash" },
+                "force_sync": true,
+                "tags": ["request-cancel-regression"],
+            })).unwrap()),
+        })),
+        PeerRequestOptions::no_options(),
+    ).await.expect("terminal request failed");
+    let mut job_id = None;
+    for _ in 0..50 {
+        let jobs = client.peer().call_tool(CallToolRequestParam {
+            name: Cow::Borrowed("enhanced_terminal_job_list"),
+            arguments: Some(serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+                "tag_filter": "request-cancel-regression",
+            })).unwrap()),
+        }).await.expect("job list failed");
+        let jobs = text_from_calltool(jobs);
+        if let Some(id) = jobs.lines().find_map(|line| line.strip_prefix("Job ID: ")) {
+            job_id = Some(id.to_string());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let job_id = job_id.expect("terminal did not register its job");
+    handle.cancel(Some("regression-test".to_string())).await.expect("request cancellation failed");
+    let mut last_status = String::new();
+    for _ in 0..50 {
+        let status = client.peer().call_tool(CallToolRequestParam {
+            name: Cow::Borrowed("enhanced_terminal_job_status"),
+            arguments: Some(serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+                "job_id": job_id,
+                "incremental": false,
+            })).unwrap()),
+        }).await.expect("job status failed");
+        last_status = text_from_calltool(status);
+        if last_status.contains("Status: Canceled") {
+            let pid = last_status.lines().find_map(|line| line.strip_prefix("PID: "))
+                .expect("job PID missing");
+            #[cfg(windows)]
+            {
+                let status = std::process::Command::new("pwsh")
+                    .args(["-NoLogo", "-NoProfile", "-Command", &format!("if (Get-Process -Id {pid} -ErrorAction SilentlyContinue) {{ exit 1 }}")])
+                    .status().expect("process check failed");
+                assert!(status.success(), "canceled job process {pid} is still running");
+            }
+            #[cfg(not(windows))]
+            {
+                let status = std::process::Command::new("kill").args(["-0", pid]).status().unwrap();
+                assert!(!status.success(), "canceled job process {pid} is still running");
+            }
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Do not leave a failed regression's process behind.
+    let _ = client.peer().call_tool(CallToolRequestParam {
+        name: Cow::Borrowed("enhanced_terminal_job_cancel"),
+        arguments: Some(serde_json::from_value::<serde_json::Map<String, Value>>(json!({"job_id": job_id})).unwrap()),
+    }).await;
+    panic!("request cancellation left the job running: {last_status}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn job_stdin_writes_to_running_async_job() {
     let client = connect_child_client().await;
 
