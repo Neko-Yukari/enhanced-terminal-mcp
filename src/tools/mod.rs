@@ -7,7 +7,7 @@ pub mod terminal_executor;
 mod windows_job;
 
 pub use job_manager::{JobManager, JobStatus};
-pub use terminal_executor::{TerminalExecutionInput, default_shell, execute_command};
+pub use terminal_executor::{TerminalExecutionInput, default_shell, execute_command, is_credential_hint};
 
 pub use job_search::{JobSearchInput, search_job};
 

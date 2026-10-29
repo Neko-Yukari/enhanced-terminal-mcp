@@ -9,6 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum JobStatus {
     Running,
+    /// Process is alive but appears to be blocked on an interactive prompt.
+    WaitingForInput,
     Completed,
     Failed,
     TimedOut,
@@ -35,6 +37,8 @@ pub struct JobRecord {
     pub tags: Vec<String>,
     /// Command summary (first N characters)
     pub summary: String,
+    /// Prompt line observed while the job waits for stdin input
+    pub input_hint: Option<String>,
 }
 
 impl JobRecord {
@@ -208,6 +212,7 @@ impl JobManager {
                 last_read_position: 0,
                 tags,
                 summary,
+                input_hint: None,
             },
         );
     }
@@ -244,6 +249,28 @@ impl JobManager {
         }
     }
 
+    /// Mark a live job as waiting on an interactive prompt.
+    pub fn mark_waiting_input(&self, job_id: &str, hint: &str) {
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(job) = jobs.get_mut(job_id) {
+            if matches!(job.status, JobStatus::Running | JobStatus::WaitingForInput) {
+                job.status = JobStatus::WaitingForInput;
+                job.input_hint = Some(hint.to_string());
+            }
+        }
+    }
+
+    /// Return a waiting job to Running once it produces new output.
+    pub fn clear_waiting_input(&self, job_id: &str) {
+        let mut jobs = self.jobs.lock().unwrap();
+        if let Some(job) = jobs.get_mut(job_id) {
+            if matches!(job.status, JobStatus::WaitingForInput) {
+                job.status = JobStatus::Running;
+            }
+            job.input_hint = None;
+        }
+    }
+
     /// Attach a PTY stdin writer to a running job.
     pub fn attach_stdin_writer(&self, job_id: &str, writer: Box<dyn Write + Send>) {
         let mut writers = self.stdin_writers.lock().unwrap();
@@ -257,7 +284,7 @@ impl JobManager {
             let job = jobs
                 .get(job_id)
                 .ok_or_else(|| anyhow::anyhow!("Job not found"))?;
-            if !matches!(job.status, JobStatus::Running) {
+            if !matches!(job.status, JobStatus::Running | JobStatus::WaitingForInput) {
                 return Err(anyhow::anyhow!("Job is not running"));
             }
         }
@@ -295,6 +322,7 @@ impl JobManager {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(job) = jobs.get_mut(job_id) {
             job.exit_code = exit_code;
+            job.input_hint = None;
             // The reader may observe the termination after cancellation was confirmed.
             if job.status != JobStatus::Canceled {
                 job.finished_at = Some(SystemTime::now());
@@ -394,7 +422,7 @@ impl JobManager {
         let canceled = {
             let mut jobs = self.jobs.lock().unwrap();
             if let Some(job) = jobs.get_mut(job_id) {
-                if matches!(job.status, JobStatus::Running) {
+                if matches!(job.status, JobStatus::Running | JobStatus::WaitingForInput) {
                     if let Some(pid) = job.pid {
                         let pid = Pid::from_raw(pid as i32);
                         kill(pid, Signal::SIGTERM)?;
@@ -402,6 +430,7 @@ impl JobManager {
 
                     job.status = JobStatus::Canceled;
                     job.finished_at = Some(SystemTime::now());
+                    job.input_hint = None;
                     true
                 } else {
                     false
@@ -421,7 +450,10 @@ impl JobManager {
 
     #[cfg(windows)]
     pub fn cancel_job(&self, job_id: &str) -> Result<()> {
-        if !self.get_job(job_id).is_some_and(|job| job.status == JobStatus::Running) {
+        let cancellable = self.get_job(job_id).is_some_and(|job| {
+            matches!(job.status, JobStatus::Running | JobStatus::WaitingForInput)
+        });
+        if !cancellable {
             anyhow::bail!("Job not found or not running");
         }
         let job = self.windows_jobs.lock().unwrap().get(job_id).cloned()
@@ -431,6 +463,7 @@ impl JobManager {
         if let Some(record) = self.jobs.lock().unwrap().get_mut(job_id) {
             record.status = JobStatus::Canceled;
             record.finished_at = Some(SystemTime::now());
+            record.input_hint = None;
         }
         self.stdin_writers.lock().unwrap().remove(job_id);
         Ok(())
