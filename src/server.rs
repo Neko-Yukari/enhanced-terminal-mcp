@@ -1,5 +1,5 @@
 use crate::detection::{detect_binaries, detect_shells};
-use crate::tools::{ReadDirection, ReadSpec, select_page, JobSearchInput, search_job, JobManager, TerminalExecutionInput, default_shell, execute_command};
+use crate::tools::{ReadDirection, ReadSpec, select_page, is_credential_hint, JobSearchInput, search_job, JobManager, TerminalExecutionInput, default_shell, execute_command};
 use chrono::{SecondsFormat, Utc};
 use rmcp::{
     ErrorData as McpError, handler::server::router::tool::ToolRouter,
@@ -285,6 +285,9 @@ RETURNS:
 - truncated: Boolean indicating if output was truncated
 - timed_out: Boolean indicating if command was killed by timeout
 - switched_to_async: Boolean indicating if command moved to background
+- status: Set when the call ended early without completing, e.g. WaitingForInput
+- input_hint: Prompt line observed when the command is blocked on stdin
+- note: Guidance for the reported status
 - denied: Boolean indicating if command was blocked
 - denial_reason: Reason for denial (if denied)"
     )]
@@ -348,7 +351,16 @@ RETURNS:
                     duration
                 ));
             }
-            result_text.push_str("Status: SWITCHED TO BACKGROUND\n");
+            match result.status.as_deref() {
+                Some(status) => result_text.push_str(&format!("Status: {}\n", status)),
+                None => result_text.push_str("Status: SWITCHED TO BACKGROUND\n"),
+            }
+            if let Some(hint) = result.input_hint.as_deref() {
+                result_text.push_str(&format!("Input Hint: {}\n", hint));
+            }
+            if let Some(note) = result.note.as_deref() {
+                result_text.push_str(&format!("Note: {}\n", note));
+            }
             result_text
                 .push_str("The command is still running. Use enhanced_terminal_job_status to check progress.\n");
             result_text.push_str("\nPartial Output:\n");
@@ -396,7 +408,7 @@ RETURNS:
 
     #[tool(
         name = "enhanced_terminal_job_status",
-        description = "Read the stored raw UTF-8 PTY transcript, preserving ANSI/repaint sequences. Default is incremental forward reading with the original 4096-token budget. Explicit direction=head/tail, start_line/line_count (1-based LF lines), or offset_bytes/limit_bytes (0-based bytes, exclusive end) never move that cursor. Tail displays text in normal forward order; before_byte anchors backward continuation. Do not mix line and byte positioning. Large lines are split by the requested preview budget: returned raw byte/line ranges, partial_line flags and Continue Selection arguments locate every segment. preview_tokens=0 disables the token limit; explicit byte limits still apply. CRLF counts as one line break; terminal cursor movement is not interpreted."
+        description = "Read the stored raw UTF-8 PTY transcript, preserving ANSI/repaint sequences. Default is incremental forward reading with the original 4096-token budget. Explicit direction=head/tail, start_line/line_count (1-based LF lines), or offset_bytes/limit_bytes (0-based bytes, exclusive end) never move that cursor. Tail displays text in normal forward order; before_byte anchors backward continuation. Do not mix line and byte positioning. Large lines are split by the requested preview budget: returned raw byte/line ranges, partial_line flags and Continue Selection arguments locate every segment. preview_tokens=0 disables the token limit; explicit byte limits still apply. CRLF counts as one line break; terminal cursor movement is not interpreted. A command blocked on stdin reports Status: WaitingForInput with the observed prompt as Input Hint."
     )]
     async fn job_status(
         &self,
@@ -423,6 +435,15 @@ RETURNS:
             "Job ID: {}\nSummary: {}\nShell: {}\nWorking Directory: {}\nStatus: {:?}\nDuration: {}\n",
             job.job_id, job.summary, job.shell, job.cwd, job.status, job.duration_string(),
         );
+        if let Some(hint) = job.input_hint.as_deref() {
+            result_text.push_str(&format!("Input Hint: {}\n", hint));
+            if is_credential_hint(hint) {
+                result_text.push_str(
+                    "Note: This looks like a credential prompt. Do not send secrets through \
+                     enhanced_terminal_job_stdin — ask the user to confirm or cancel the job.\n",
+                );
+            }
+        }
         if input.full_command { result_text.push_str(&format!("Command: {}\n", job.command)); }
         if let Some(code) = job.exit_code { result_text.push_str(&format!("Exit Code: {}\n", code)); }
         if let Some(pid) = job.pid { result_text.push_str(&format!("PID: {}\n", pid)); }
@@ -484,7 +505,7 @@ BEHAVIOR:
 
 FILTERING:
 - status_filter: Match any of the provided statuses
-  - Valid values: \"Running\", \"Completed\", \"Failed\", \"TimedOut\", \"Canceled\"
+  - Valid values: \"Running\", \"WaitingForInput\", \"Completed\", \"Failed\", \"TimedOut\", \"Canceled\"
 - tag_filter: Show only jobs with the specified tag
 - cwd_filter: Show only jobs from a specific directory
 - Filters are combined with AND logic
@@ -493,7 +514,7 @@ RETURNS: List of jobs with:
 - job_id: Unique readable adjective-noun-number identifier
 - command: Full executed command
 - summary: First 100 characters of command
-- status: Current status (Running, Completed, Failed, TimedOut, Canceled)
+- status: Current status (Running, WaitingForInput, Completed, Failed, TimedOut, Canceled)
 - exit_code: Exit code if completed
 - duration: Time elapsed since start
 - tags: Optional tags assigned to this job
@@ -513,6 +534,7 @@ RETURNS: List of jobs with:
                 .iter()
                 .filter_map(|s| match s.as_str() {
                     "Running" => Some(JobStatus::Running),
+                    "WaitingForInput" => Some(JobStatus::WaitingForInput),
                     "Completed" => Some(JobStatus::Completed),
                     "Failed" => Some(JobStatus::Failed),
                     "TimedOut" => Some(JobStatus::TimedOut),
@@ -628,9 +650,10 @@ PARAMETERS:
 - input (string, required): Exact UTF-8 input to write; include \n to submit a line
 
 BEHAVIOR:
-- Writes to the PTY stdin for a job that is still Running
+- Writes to the PTY stdin for a job that is Running or WaitingForInput
 - Does not append a newline automatically
 - Useful for answering prompts or interacting with commands after they switch to background
+- Refuses to answer a detected credential prompt (password/passphrase); ask the user instead
 
 RETURNS:
 - Confirmation with the number of bytes written"
@@ -639,6 +662,24 @@ RETURNS:
         &self,
         Parameters(input): Parameters<JobStdinInput>,
     ) -> Result<CallToolResult, McpError> {
+        // Credential prompts must not be answered by the model itself.
+        if let Some(job) = self.job_manager.get_job(&input.job_id) {
+            if matches!(job.status, crate::tools::JobStatus::WaitingForInput) {
+                if let Some(hint) = job.input_hint.as_deref() {
+                    if is_credential_hint(hint) {
+                        return Err(McpError::invalid_params(
+                            format!(
+                                "Job {} is waiting on a credential prompt ({:?}). Do not send secrets \
+                                 through job_stdin — ask the user to confirm or cancel the job.",
+                                input.job_id, hint
+                            ),
+                            None::<serde_json::Value>,
+                        ));
+                    }
+                }
+            }
+        }
+
         let bytes_written = self
             .job_manager
             .write_stdin(&input.job_id, &input.input)
@@ -740,8 +781,8 @@ impl rmcp::ServerHandler for EnhancedTerminalServer {
             "Prefer enhanced_terminal for ordinary commands, builds, background jobs and interactive tasks. \
              Fall back to OpenCode native shell only when enhanced_terminal is unavailable, lacks a required capability, or has a confirmed compatibility issue; state the reason.\n\
              Supply either shell command or native program with an args array; no shell translation. \
-             GIT_PAGER and PAGER default to cat; explicit env_vars override them. Foreground calls return a job ID within 60 seconds even with force_sync; the command keeps running in the background.\n\
-             For stdin, start force_async=true then call enhanced_terminal_job_stdin; include a newline to submit.\n\
+             GIT_PAGER and PAGER default to cat; explicit env_vars override them. Foreground calls return a job ID within 60 seconds even with force_sync — except that a detected input prompt always returns early — and the command keeps running in the background.\n\
+             For stdin, start force_async=true then call enhanced_terminal_job_stdin; include a newline to submit. A command blocked on stdin reports Status: WaitingForInput with the observed prompt line.\n\
              Default shell: {}. Previews default to 4096 o200k tokens. \
              Read head/tail or 1-based start_line/line_count; raw byte positions are 0-based with exclusive ends. Truncated output includes a job ID and readback call; follow returned byte offsets with preview_tokens=0 for exact pages. \
              Full command is available via job_status full_command=true. \

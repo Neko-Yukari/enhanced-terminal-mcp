@@ -495,6 +495,8 @@ Set `force_sync: true` to wait for up to 60 seconds. Foreground waits are capped
 
 Commands default to `GIT_PAGER=cat` and `PAGER=cat` so Git output does not wait for a paging prompt. Explicit `env_vars` can override these values for an interactive job.
 
+A command that stops on an interactive prompt does not sit silently in the foreground: the call returns early with `Status: WaitingForInput`, the observed prompt line as `Input Hint`, and a `Note` explaining how to answer or cancel. Background jobs get the same status while they wait and fall back to `Running` when output resumes. Prompts that look like credential requests are never answerable through `enhanced_terminal_job_stdin`; ask the user instead.
+
 Cancelling an active MCP terminal request cancels its foreground job through the same process termination path as `enhanced_terminal_job_cancel`. Once a call has returned a background job ID, the job runs independently of that completed request; cancel it with `enhanced_terminal_job_cancel` when needed.
 
 ### Incremental Output
@@ -510,7 +512,7 @@ This enables streaming-like behavior without actual streaming infrastructure.
 
 ### Interactive Job Input
 
-Use `enhanced_terminal_job_stdin` to write to a running job's PTY stdin after it has switched to background. For commands that wait for input, start them with `force_async: true` so the first call returns a job ID immediately. The stdin tool writes exactly the provided `input` string and does not append a newline automatically.
+Use `enhanced_terminal_job_stdin` to write to a running job's PTY stdin after it has switched to background. For commands that wait for input, start them with `force_async: true` so the first call returns a job ID immediately; a command that blocks on stdin is reported as `Status: WaitingForInput` either way. The stdin tool writes exactly the provided `input` string and does not append a newline automatically.
 
 ### Output Pagination
 
