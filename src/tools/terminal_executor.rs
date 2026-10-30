@@ -59,6 +59,9 @@ pub struct TerminalExecutionInput {
     /// Optional tags for categorizing jobs (e.g., ["build", "ci"])
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Response encoding: "text" (default) or "json" with the structured result.
+    #[serde(default)]
+    pub response_format: Option<String>,
 }
 
 fn default_cwd() -> String {

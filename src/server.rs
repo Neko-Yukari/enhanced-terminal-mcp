@@ -11,8 +11,9 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs::{File, OpenOptions},
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Mutex,
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -63,6 +64,33 @@ fn enhanced_terminal_call_log_path() -> PathBuf {
         })
 }
 
+/// The call log records every command's parameters and is append-only, so it is
+/// capped: past the limit the current file becomes one `.1` generation.
+const DEFAULT_CALL_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+fn call_log_max_bytes() -> u64 {
+    std::env::var("ENHANCED_TERMINAL_CALL_LOG_MAX_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CALL_LOG_MAX_BYTES)
+}
+
+fn rotate_call_log_if_needed(path: &Path) {
+    let max = call_log_max_bytes();
+    if max == 0 {
+        return;
+    }
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.len() < max {
+        return;
+    }
+    let backup = path.with_extension("jsonl.1");
+    let _ = std::fs::remove_file(&backup);
+    let _ = std::fs::rename(path, &backup);
+}
+
 #[cfg(unix)]
 struct CallLogFileLock(RawFd);
 
@@ -105,6 +133,7 @@ fn log_enhanced_terminal_call(input: &TerminalExecutionInput) -> io::Result<()> 
         .map_err(|e| io::Error::other(format!("call log mutex poisoned: {e}")))?;
 
     let log_path = enhanced_terminal_call_log_path();
+    rotate_call_log_if_needed(&log_path);
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -173,6 +202,9 @@ pub struct JobListInput {
     /// Sort order: "newest" (default) or "oldest"
     #[serde(default = "default_sort_order")]
     pub sort_order: String,
+    /// Response encoding: "text" (default) or "json" for machine-readable output.
+    #[serde(default)]
+    pub response_format: Option<String>,
 }
 
 fn default_max_jobs() -> usize {
@@ -197,6 +229,87 @@ pub struct JobStdinInput {
     pub job_id: String,
     /// Exact UTF-8 input to write. Include a trailing newline (\n) to submit a line.
     pub input: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JobWaitInput {
+    /// Job IDs to wait for
+    pub job_ids: Vec<String>,
+    /// Literal substring that ends the wait early once it appears in a job's output
+    #[serde(default)]
+    pub pattern: Option<String>,
+    /// Maximum total wait in milliseconds (default 60000; 0 returns an immediate snapshot)
+    #[serde(default = "default_wait_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Poll interval in milliseconds (default 250)
+    #[serde(default = "default_wait_poll_ms")]
+    pub poll_interval_ms: u64,
+    /// Trailing lines returned per job (default 20)
+    #[serde(default = "default_wait_tail_lines")]
+    pub tail_lines: usize,
+    /// Token budget for each job's trailing output (default 1000; 0 disables)
+    #[serde(default = "default_wait_preview_tokens")]
+    pub preview_tokens: usize,
+    /// Response encoding: "json" (default) or "text"
+    #[serde(default = "default_wait_response_format")]
+    pub response_format: String,
+}
+
+fn default_wait_timeout_ms() -> u64 {
+    60_000
+}
+
+fn default_wait_poll_ms() -> u64 {
+    250
+}
+
+fn default_wait_tail_lines() -> usize {
+    20
+}
+
+fn default_wait_preview_tokens() -> usize {
+    1000
+}
+
+fn default_wait_response_format() -> String {
+    "json".to_string()
+}
+
+/// One job's snapshot as reported by `job_wait`: last lines of transcript plus
+/// the facts a caller needs to decide whether to keep waiting or react.
+fn job_wait_entry(
+    job: &crate::tools::job_manager::JobRecord,
+    waited: Duration,
+    settled: bool,
+    matched: bool,
+    input: &JobWaitInput,
+) -> serde_json::Value {
+    let page = select_page(
+        &job.full_output,
+        &ReadSpec {
+            direction: Some(ReadDirection::Tail),
+            offset_bytes: None,
+            limit_bytes: None,
+            before_byte: None,
+            start_line: None,
+            line_count: Some(input.tail_lines.max(1)),
+            cursor: 0,
+            preview_tokens: input.preview_tokens,
+        },
+    )
+    .ok();
+    serde_json::json!({
+        "job_id": job.job_id,
+        "status": format!("{:?}", job.status),
+        "settled": settled,
+        "pattern_matched": matched,
+        "exit_code": job.exit_code,
+        "duration": job.duration_string(),
+        "waited_ms": waited.as_millis() as u64,
+        "truncated": page.as_ref().map(|page| page.selection_has_more).unwrap_or(false),
+        "output_tail": page.map(|page| page.text).unwrap_or_default(),
+    })
 }
 
 #[derive(Clone)]
@@ -324,6 +437,14 @@ RETURNS:
             .map_err(|e| {
                 McpError::internal_error(format!("Command execution failed: {}", e), None)
             })?;
+
+        let wants_json = matches!(input.response_format.as_deref(), Some("json"));
+        if wants_json {
+            let text = serde_json::to_string(&result).map_err(|error| {
+                McpError::internal_error(format!("Failed to serialize result: {error}"), None)
+            })?;
+            return Ok(CallToolResult::success(vec![Content::text(text)]));
+        }
 
         if result.denied {
             let mut result_text = format!("Command: {}\n", result.command);
@@ -472,6 +593,144 @@ RETURNS:
     }
 
     #[tool(
+        name = "enhanced_terminal_job_wait",
+        description = "Wait for one or more jobs instead of polling them one by one.
+
+PARAMETERS:
+- job_ids (array, required): jobs to wait for
+- pattern (string, optional): literal substring that ends the wait early once it appears in a job's transcript
+- timeout_ms (number, default 60000): maximum total wait; 0 returns an immediate snapshot
+- poll_interval_ms (number, default 250): internal polling interval
+- tail_lines (number, default 20): trailing transcript lines reported per job
+- preview_tokens (number, default 1000): token budget per job's trailing output; 0 disables it
+- response_format (\"json\" by default, or \"text\"): response encoding
+
+BEHAVIOR:
+- A job settles when it leaves Running/WaitingForInput (Completed, Failed, TimedOut, Canceled)
+- Returns as soon as every job settled or matched the pattern, or the timeout expires
+- Reading here never moves the incremental cursor used by enhanced_terminal_job_status
+- Unknown job ids are reported per entry instead of failing the whole call
+
+RETURNS (json): { waited_ms, timed_out, jobs: [{ job_id, status, settled, pattern_matched, exit_code, duration, waited_ms, truncated, output_tail }] }"
+    )]
+    async fn job_wait(
+        &self,
+        Parameters(input): Parameters<JobWaitInput>,
+    ) -> Result<CallToolResult, McpError> {
+        use crate::tools::JobStatus;
+
+        if input.job_ids.is_empty() {
+            return Err(McpError::invalid_params(
+                "job_ids must contain at least one job id",
+                None,
+            ));
+        }
+
+        let pattern = input
+            .pattern
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let started = Instant::now();
+        let deadline = started.checked_add(Duration::from_millis(input.timeout_ms));
+        let poll = Duration::from_millis(input.poll_interval_ms.max(25));
+
+        let mut pending = input.job_ids.clone();
+        let mut entries: Vec<serde_json::Value> = Vec::new();
+
+        loop {
+            let mut still_running = Vec::new();
+            for job_id in pending.drain(..) {
+                let Some(job) = self.job_manager.get_job(&job_id) else {
+                    entries.push(serde_json::json!({ "job_id": job_id, "error": "job not found" }));
+                    continue;
+                };
+                let matched = pattern.is_some_and(|value| job.full_output.contains(value));
+                let settled = !matches!(job.status, JobStatus::Running | JobStatus::WaitingForInput);
+                if settled || matched {
+                    entries.push(job_wait_entry(&job, started.elapsed(), settled, matched, &input));
+                } else {
+                    still_running.push(job_id);
+                }
+            }
+            pending = still_running;
+            if pending.is_empty() {
+                break;
+            }
+            let Some(deadline) = deadline else {
+                break;
+            };
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep(poll.min(deadline - now)).await;
+        }
+
+        let timed_out = !pending.is_empty();
+        for job_id in pending {
+            match self.job_manager.get_job(&job_id) {
+                Some(job) => entries.push(job_wait_entry(
+                    &job,
+                    started.elapsed(),
+                    false,
+                    false,
+                    &input,
+                )),
+                None => entries.push(serde_json::json!({ "job_id": job_id, "error": "job not found" })),
+            }
+        }
+
+        if input.response_format != "text" {
+            let text = serde_json::to_string(&serde_json::json!({
+                "waited_ms": started.elapsed().as_millis() as u64,
+                "timed_out": timed_out,
+                "jobs": entries,
+            }))
+            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            return Ok(CallToolResult::success(vec![Content::text(text)]));
+        }
+
+        let mut result_text = format!(
+            "Waited: {} ms\nTimed Out: {}\n",
+            started.elapsed().as_millis(),
+            timed_out
+        );
+        for entry in &entries {
+            let job_id = entry
+                .get("job_id")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?");
+            if entry.get("error").is_some() {
+                result_text.push_str(&format!("\nJob: {job_id}\n  Error: job not found\n"));
+                continue;
+            }
+            result_text.push_str(&format!(
+                "\nJob: {job_id}\n  Status: {}\n  Settled: {}\n  Pattern Matched: {}\n",
+                entry.get("status").and_then(|value| value.as_str()).unwrap_or("?"),
+                entry.get("settled").and_then(|value| value.as_bool()).unwrap_or(false),
+                entry
+                    .get("pattern_matched")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
+            ));
+            if let Some(code) = entry.get("exit_code").and_then(|value| value.as_i64()) {
+                result_text.push_str(&format!("  Exit Code: {code}\n"));
+            }
+            result_text.push_str(&format!(
+                "  Duration: {}\n  Waited: {} ms\n  Output Tail:\n{}\n",
+                entry.get("duration").and_then(|value| value.as_str()).unwrap_or("?"),
+                entry.get("waited_ms").and_then(|value| value.as_u64()).unwrap_or(0),
+                entry
+                    .get("output_tail")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+            ));
+        }
+        Ok(CallToolResult::success(vec![Content::text(result_text)]))
+    }
+
+    #[tool(
         name = "enhanced_terminal_job_search",
         description = "Search only one job's complete stored UTF-8 PTY transcript. mode=literal uses rg fixed strings (default); regex uses rg; semantic uses the existing local sgrep text model offline, without a persistent index. No unrelated files are searched. Results include raw transcript byte offsets, line ranges, explicitly bounded context and concrete job_status readback arguments. ANSI and repaint sequences are preserved: this is a raw transcript view, not clean stdout. Search does not move the incremental cursor or change the original 4096-token preview default."
     )]
@@ -567,8 +826,34 @@ RETURNS: List of jobs with:
 
         if jobs_to_show.is_empty() {
             return Ok(CallToolResult::success(vec![Content::text(
-                "No jobs found.".to_string(),
+                if matches!(input.response_format.as_deref(), Some("json")) {
+                    "[]".to_string()
+                } else {
+                    "No jobs found.".to_string()
+                },
             )]));
+        }
+
+        if matches!(input.response_format.as_deref(), Some("json")) {
+            let listed: Vec<serde_json::Value> = jobs_to_show
+                .iter()
+                .map(|job| {
+                    serde_json::json!({
+                        "job_id": job.job_id,
+                        "summary": job.summary,
+                        "status": format!("{:?}", job.status),
+                        "exit_code": job.exit_code,
+                        "duration": job.duration_string(),
+                        "cwd": job.cwd,
+                        "shell": job.shell,
+                        "tags": job.tags,
+                        "output_preview": job.output.chars().take(100).collect::<String>(),
+                    })
+                })
+                .collect();
+            let text = serde_json::to_string(&listed)
+                .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            return Ok(CallToolResult::success(vec![Content::text(text)]));
         }
 
         let mut result_text = format!("Found {} job(s):\n\n", jobs_to_show.len());
@@ -592,12 +877,12 @@ RETURNS: List of jobs with:
             result_text.push_str(&format!("  Duration: {}\n", job.duration_string()));
 
             // Show output preview (first 100 chars)
-            let preview = if job.output.len() > 100 {
-                format!("{}...", &job.output[..100])
+            let preview: String = job.output.chars().take(100).collect();
+            if preview.len() < job.output.len() {
+                result_text.push_str(&format!("  Output Preview: {}...\n", preview.trim()));
             } else {
-                job.output.clone()
-            };
-            result_text.push_str(&format!("  Output Preview: {}\n", preview.trim()));
+                result_text.push_str(&format!("  Output Preview: {}\n", preview.trim()));
+            }
             result_text.push_str("\n");
         }
 

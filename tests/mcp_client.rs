@@ -901,3 +901,120 @@ async fn sudo_prime_then_cached_sudo_n_opt_in() {
         "expected cached sudo to work; got: {second_text}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn job_wait_returns_settled_job_with_json_payload() {
+    let client = connect_child_client().await;
+
+    let run = client
+        .peer()
+        .call_tool(CallToolRequestParam {
+            name: Cow::Borrowed("enhanced_terminal"),
+            arguments: Some(
+                serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+                    "command": "echo start; sleep 2; echo done",
+                    "cwd": ".",
+                    "force_async": true,
+                    "preview_tokens": 0,
+                    "response_format": "json"
+                }))
+                .expect("tool arguments must be a JSON object")
+                .into_iter()
+                .collect(),
+            ),
+        })
+        .await
+        .expect("tools/call enhanced_terminal failed");
+
+    let run_text = text_from_calltool(run);
+    let run_json: Value = serde_json::from_str(&run_text)
+        .unwrap_or_else(|error| panic!("execution result was not JSON ({error}): {run_text}"));
+    let job_id = run_json["job_id"]
+        .as_str()
+        .expect("missing job_id in JSON execution result")
+        .to_string();
+    assert_eq!(
+        run_json["switched_to_async"],
+        json!(true),
+        "expected a background job: {run_json}"
+    );
+
+    let waited_started = std::time::Instant::now();
+    let waited = client
+        .peer()
+        .call_tool(CallToolRequestParam {
+            name: Cow::Borrowed("enhanced_terminal_job_wait"),
+            arguments: Some(
+                serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+                    "job_ids": [job_id],
+                    "pattern": "done",
+                    "timeout_ms": 20000,
+                    "tail_lines": 5
+                }))
+                .expect("tool arguments must be a JSON object")
+                .into_iter()
+                .collect(),
+            ),
+        })
+        .await
+        .expect("tools/call enhanced_terminal_job_wait failed");
+
+    let waited_text = text_from_calltool(waited);
+    let waited_json: Value = serde_json::from_str(&waited_text)
+        .unwrap_or_else(|error| panic!("wait result was not JSON ({error}): {waited_text}"));
+    assert_eq!(
+        waited_json["timed_out"],
+        json!(false),
+        "wait timed out before the pattern appeared: {waited_json}"
+    );
+    let entry = &waited_json["jobs"][0];
+    assert_eq!(
+        entry["pattern_matched"],
+        json!(true),
+        "pattern was not reported as matched: {waited_json}"
+    );
+    assert!(
+        entry["output_tail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("done"),
+        "missing trailing output: {waited_json}"
+    );
+    assert!(
+        waited_started.elapsed() >= Duration::from_millis(500),
+        "wait returned before the job produced output: {waited_json}"
+    );
+
+    // A matching pattern ends that job's wait early, so a second wait without
+    // one must still observe the process exiting.
+    let settled = client
+        .peer()
+        .call_tool(CallToolRequestParam {
+            name: Cow::Borrowed("enhanced_terminal_job_wait"),
+            arguments: Some(
+                serde_json::from_value::<serde_json::Map<String, Value>>(json!({
+                    "job_ids": [job_id],
+                    "timeout_ms": 20000
+                }))
+                .expect("tool arguments must be a JSON object")
+                .into_iter()
+                .collect(),
+            ),
+        })
+        .await
+        .expect("tools/call enhanced_terminal_job_wait failed");
+
+    let settled_json: Value = serde_json::from_str(&text_from_calltool(settled))
+        .unwrap_or_else(|error| panic!("second wait result was not JSON ({error})"));
+    let settled_entry = &settled_json["jobs"][0];
+    assert_eq!(
+        settled_entry["settled"],
+        json!(true),
+        "job did not settle: {settled_json}"
+    );
+    assert_eq!(
+        settled_entry["status"],
+        json!("Completed"),
+        "unexpected final status: {settled_json}"
+    );
+}

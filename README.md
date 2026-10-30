@@ -33,7 +33,12 @@ A standalone Model Context Protocol (MCP) server that provides terminal executio
    - Include `\n` in `input` to submit a line
    - Useful for prompts after commands switch to background
 
-6. **detect_binaries** - Detect developer tools with 16 concurrent checks
+6. **enhanced_terminal_job_wait** - Wait for jobs instead of polling them
+   - Waits for one or more jobs until they settle or a literal `pattern` appears in their output
+   - Returns JSON with status, exit code, elapsed wait and the trailing output per job
+   - Reading here never moves the `job_status` incremental cursor
+
+7. **detect_binaries** - Detect developer tools with 16 concurrent checks
    - Scans PATH for 190+ common development tools across 26 categories
    - Fast parallel version detection
    - Supports filtering by category (rust_tools, python_tools, etc.)
@@ -178,6 +183,12 @@ Add to your MCP client configuration:
 Every `enhanced_terminal` tool call is appended as one JSON object per line to `enhanced_terminal_calls.jsonl` in the repository root. Each entry includes an RFC3339 UTC `datetime`, the tool name, and the full submitted parameters. Writes use an in-process mutex and, on Unix, an exclusive file lock so concurrent tool calls and test server processes do not interleave JSON records.
 
 Override the log path with `ENHANCED_TERMINAL_CALL_LOG_PATH` if needed.
+
+The log rotates instead of growing without bound: once it reaches 16 MiB the current file becomes one `enhanced_terminal_calls.jsonl.1` generation and a fresh file starts. Set `ENHANCED_TERMINAL_CALL_LOG_MAX_BYTES` to change the limit (0 disables rotation).
+
+### JSON responses
+
+`enhanced_terminal`, `enhanced_terminal_job_list` and `enhanced_terminal_job_wait` accept `response_format: "json"` for machine-readable results; `job_wait` defaults to it. The text formats are unchanged, so existing callers keep working.
 
 ### Choosing a tool in OpenCode V2
 
@@ -355,6 +366,28 @@ Combined filters with sort order:
   "sort_order": "oldest"
 }
 ```
+
+#### enhanced_terminal_job_wait
+
+Wait for a build to finish and get its tail in one call:
+```json
+{
+  "job_ids": ["eager-lantern-43"],
+  "timeout_ms": 120000,
+  "tail_lines": 20
+}
+```
+
+Wait for a server to print its listening line, or for several jobs at once:
+```json
+{
+  "job_ids": ["eager-lantern-43", "swift-otter-12"],
+  "pattern": "listening on",
+  "timeout_ms": 30000
+}
+```
+
+A matching `pattern` ends that job's wait immediately, which can be before the process exits; `settled` reports whether it exited. Pass `response_format: "text"` for a human-readable summary.
 
 #### enhanced_terminal_job_cancel
 
