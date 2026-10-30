@@ -1,0 +1,6 @@
+# Keep build output out of target/release: both OpenCode and DSH run the
+# installed binary from target/release, and Windows refuses to replace an
+# executable that a live process still has open. Build into target-build,
+# then install with scripts/install.ps1.
+[build]
+target-dir = "target-build"
