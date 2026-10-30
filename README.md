@@ -464,6 +464,8 @@ cargo build
 cargo test
 ```
 
+The integration tests repeat each case on every shell this machine provides — `bash` on Unix, `cmd`, `powershell` and `pwsh` on Windows — so a regression that only shows up in one shell is visible without a separate matrix.
+
 ### Running Tests for Denylist
 
 ```bash
