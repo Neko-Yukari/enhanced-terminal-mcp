@@ -188,7 +188,7 @@ The log rotates instead of growing without bound: once it reaches 16 MiB the cur
 
 ### JSON responses
 
-`enhanced_terminal`, `enhanced_terminal_job_list` and `enhanced_terminal_job_wait` accept `response_format: "json"` for machine-readable results; `job_wait` defaults to it. The text formats are unchanged, so existing callers keep working.
+Every tool answers with one JSON document, so callers read fields instead of parsing text. There is no text format and no `response_format` switch. A truncated preview sets `truncated: true` and leaves the full transcript reachable through `job_status` byte/line reads or `job_wait` tails.
 
 ### Choosing a tool in OpenCode V2
 
@@ -387,7 +387,7 @@ Wait for a server to print its listening line, or for several jobs at once:
 }
 ```
 
-A matching `pattern` ends that job's wait immediately, which can be before the process exits; `settled` reports whether it exited. Pass `response_format: "text"` for a human-readable summary.
+A matching `pattern` ends that job's wait immediately, which can be before the process exits; `settled` reports whether it exited.
 
 #### enhanced_terminal_job_cancel
 
@@ -528,7 +528,7 @@ Set `force_sync: true` to wait for up to 60 seconds. Foreground waits are capped
 
 Commands default to `GIT_PAGER=cat` and `PAGER=cat` so Git output does not wait for a paging prompt. Explicit `env_vars` can override these values for an interactive job.
 
-A command that stops on an interactive prompt does not sit silently in the foreground: the call returns early with `Status: WaitingForInput`, the observed prompt line as `Input Hint`, and a `Note` explaining how to answer or cancel. Background jobs get the same status while they wait and fall back to `Running` when output resumes. Prompts that look like credential requests are never answerable through `enhanced_terminal_job_stdin`; ask the user instead.
+A command that stops on an interactive prompt does not sit silently in the foreground: the call returns early with `status: "WaitingForInput"`, the observed prompt in `input_hint`, and a `note` explaining how to answer or cancel. Background jobs get the same status while they wait and fall back to `Running` when output resumes. Prompts that look like credential requests are never answerable through `enhanced_terminal_job_stdin`; ask the user instead.
 
 Cancelling an active MCP terminal request cancels its foreground job through the same process termination path as `enhanced_terminal_job_cancel`. Once a call has returned a background job ID, the job runs independently of that completed request; cancel it with `enhanced_terminal_job_cancel` when needed.
 
@@ -545,7 +545,7 @@ This enables streaming-like behavior without actual streaming infrastructure.
 
 ### Interactive Job Input
 
-Use `enhanced_terminal_job_stdin` to write to a running job's PTY stdin after it has switched to background. For commands that wait for input, start them with `force_async: true` so the first call returns a job ID immediately; a command that blocks on stdin is reported as `Status: WaitingForInput` either way. The stdin tool writes exactly the provided `input` string and does not append a newline automatically.
+Use `enhanced_terminal_job_stdin` to write to a running job's PTY stdin after it has switched to background. For commands that wait for input, start them with `force_async: true` so the first call returns a job ID immediately; a command that blocks on stdin reports `status: "WaitingForInput"` either way. The stdin tool writes exactly the provided `input` string, does not append a newline automatically, and replies with `bytes_written`.
 
 ### Output Pagination
 

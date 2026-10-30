@@ -104,6 +104,12 @@ fn text_from_calltool(res: rmcp::model::CallToolResult) -> String {
     out
 }
 
+fn json_of(res: rmcp::model::CallToolResult) -> Value {
+    let text = text_from_calltool(res);
+    serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("expected a JSON reply ({error}): {text}"))
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn list_tools_smoke() {
     let client = connect_child_client().await;
@@ -361,21 +367,15 @@ async fn enhanced_terminal_echo() {
         .await
         .expect("tools/call enhanced_terminal failed");
 
-    let text = text_from_calltool(res);
-    assert!(text.contains("hello"), "unexpected output: {text}");
-    assert!(
-        text.contains("Exit Code: 0"),
-        "exit code should not use Option debug formatting: {text}"
-    );
-    assert!(
-        !text.contains("Exit Code: Some("),
-        "exit code leaked Option debug formatting: {text}"
-    );
+    let result = json_of(res);
+    let output = result["output"].as_str().unwrap_or_default();
+    assert!(output.contains("hello"), "unexpected output: {result}");
+    assert_eq!(result["exit_code"], json!(0), "exit code missing: {result}");
+    assert_eq!(result["success"], json!(true), "success flag missing: {result}");
 
-    let job_id = text
-        .lines()
-        .find_map(|line| line.strip_prefix("Job ID: "))
-        .expect("missing job id");
+    let job_id = result["job_id"]
+        .as_str()
+        .expect("missing job id in JSON reply");
     let parts: Vec<&str> = job_id.split('-').collect();
     assert!(
         parts.len() == 3 && parts[2].parse::<u64>().is_ok() && !job_id.starts_with("job-"),
@@ -400,9 +400,11 @@ async fn git_diff_disables_default_pager() {
             "force_sync": true,
         })).unwrap()),
     })).await.expect("git diff request never returned").expect("git diff call failed");
-    let text = text_from_calltool(result);
-    assert!(text.contains("+after"), "diff did not reach stdout: {text}");
-    assert!(!text.contains("Press RETURN") && !text.contains("TIMED OUT"), "pager blocked git diff: {text}");
+    let json = json_of(result);
+    let output = json["output"].as_str().unwrap_or_default();
+    assert!(output.contains("+after"), "diff did not reach stdout: {json}");
+    assert_eq!(json["timed_out"], json!(false), "pager blocked git diff: {json}");
+    assert!(!output.contains("Press RETURN"), "pager blocked git diff: {json}");
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -422,9 +424,13 @@ async fn forced_sync_returns_background_job_after_bounded_wait() {
             "force_sync": true,
         })).unwrap()),
     })).await.expect("force_sync blocked past the foreground limit").expect("terminal call failed");
-    let text = text_from_calltool(run);
-    assert!(text.contains("SWITCHED TO BACKGROUND"), "request did not release its caller: {text}");
-    let job_id = text.lines().find_map(|line| line.strip_prefix("Job ID: ")).unwrap();
+    let run = json_of(run);
+    assert_eq!(
+        run["switched_to_async"],
+        json!(true),
+        "request did not release its caller: {run}"
+    );
+    let job_id = run["job_id"].as_str().unwrap().to_string();
     let input = client.peer().call_tool(CallToolRequestParam {
         name: Cow::Borrowed("enhanced_terminal_job_stdin"),
         arguments: Some(serde_json::from_value::<serde_json::Map<String, Value>>(json!({
@@ -441,9 +447,12 @@ async fn forced_sync_returns_background_job_after_bounded_wait() {
                 "incremental": false,
             })).unwrap()),
         }).await.expect("job status failed");
-        let status = text_from_calltool(status);
-        if status.contains("Status: Completed") {
-            assert!(status.contains("received:still-running"), "command lost its input: {status}");
+        let status = json_of(status);
+        if status["status"] == json!("Completed") {
+            assert!(
+                status["output"].as_str().unwrap_or_default().contains("received:still-running"),
+                "command lost its input: {status}"
+            );
             return;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -482,8 +491,10 @@ async fn cancelled_request_terminates_foreground_job() {
                 "tag_filter": "request-cancel-regression",
             })).unwrap()),
         }).await.expect("job list failed");
-        let jobs = text_from_calltool(jobs);
-        if let Some(id) = jobs.lines().find_map(|line| line.strip_prefix("Job ID: ")) {
+        let jobs = json_of(jobs);
+        if let Some(id) = jobs.as_array().and_then(|entries| entries.first())
+            .and_then(|entry| entry["job_id"].as_str())
+        {
             job_id = Some(id.to_string());
             break;
         }
@@ -491,7 +502,7 @@ async fn cancelled_request_terminates_foreground_job() {
     }
     let job_id = job_id.expect("terminal did not register its job");
     handle.cancel(Some("regression-test".to_string())).await.expect("request cancellation failed");
-    let mut last_status = String::new();
+    let mut last_status = Value::Null;
     for _ in 0..50 {
         let status = client.peer().call_tool(CallToolRequestParam {
             name: Cow::Borrowed("enhanced_terminal_job_status"),
@@ -500,10 +511,9 @@ async fn cancelled_request_terminates_foreground_job() {
                 "incremental": false,
             })).unwrap()),
         }).await.expect("job status failed");
-        last_status = text_from_calltool(status);
-        if last_status.contains("Status: Canceled") {
-            let pid = last_status.lines().find_map(|line| line.strip_prefix("PID: "))
-                .expect("job PID missing");
+        last_status = json_of(status);
+        if last_status["status"] == json!("Canceled") {
+            let pid = last_status["pid"].as_u64().expect("job PID missing");
             #[cfg(windows)]
             {
                 let status = std::process::Command::new("pwsh")
@@ -552,14 +562,14 @@ async fn job_stdin_writes_to_running_async_job() {
         .await
         .expect("tools/call enhanced_terminal failed");
 
-    let run_text = text_from_calltool(run);
-    assert!(
-        run_text.contains("SWITCHED TO BACKGROUND"),
-        "expected async job: {run_text}"
+    let run_json = json_of(run);
+    assert_eq!(
+        run_json["switched_to_async"],
+        json!(true),
+        "expected async job: {run_json}"
     );
-    let job_id = run_text
-        .lines()
-        .find_map(|line| line.strip_prefix("Job ID: "))
+    let job_id = run_json["job_id"]
+        .as_str()
         .expect("missing job id")
         .to_string();
 
@@ -580,13 +590,14 @@ async fn job_stdin_writes_to_running_async_job() {
         .await
         .expect("tools/call enhanced_terminal_job_stdin failed");
 
-    let stdin_text = text_from_calltool(stdin);
-    assert!(
-        stdin_text.contains("Wrote 17 bytes"),
-        "unexpected stdin confirmation: {stdin_text}"
+    let stdin_json = json_of(stdin);
+    assert_eq!(
+        stdin_json["bytes_written"],
+        json!(17),
+        "unexpected stdin confirmation: {stdin_json}"
     );
 
-    let mut last_status = String::new();
+    let mut last_status = Value::Null;
     for _ in 0..50 {
         let status = client
             .peer()
@@ -606,8 +617,9 @@ async fn job_stdin_writes_to_running_async_job() {
             .await
             .expect("tools/call enhanced_terminal_job_status failed");
 
-        last_status = text_from_calltool(status);
-        if last_status.contains("got:hello from stdin") && last_status.contains("Status: Completed")
+        last_status = json_of(status);
+        if last_status["status"] == json!("Completed")
+            && last_status["output"].as_str().unwrap_or_default().contains("got:hello from stdin")
         {
             return;
         }
@@ -642,17 +654,14 @@ async fn enhanced_terminal_preview_tokens_truncates_output() {
         .await
         .expect("tools/call enhanced_terminal failed");
 
-    let text = text_from_calltool(res);
-    assert!(text.contains("alpha beta"), "unexpected output: {text}");
-    let output_section = text.split("Output:\n").nth(1).unwrap_or("");
+    let json = json_of(res);
+    let output = json["output"].as_str().unwrap_or_default();
+    assert!(output.contains("alpha beta"), "unexpected output: {json}");
     assert!(
-        !output_section.contains("gamma"),
-        "preview was not token-truncated: {text}"
+        !output.contains("gamma"),
+        "preview was not token-truncated: {json}"
     );
-    assert!(
-        text.contains("Output truncated"),
-        "missing truncation notice: {text}"
-    );
+    assert_eq!(json["truncated"], json!(true), "missing truncation flag: {json}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -682,10 +691,9 @@ async fn job_status_hides_full_command_by_default() {
         .await
         .expect("tools/call enhanced_terminal failed");
 
-    let run_text = text_from_calltool(run);
-    let job_id = run_text
-        .lines()
-        .find_map(|line| line.strip_prefix("Job ID: "))
+    let run_json = json_of(run);
+    let job_id = run_json["job_id"]
+        .as_str()
         .expect("missing job id")
         .to_string();
 
@@ -706,18 +714,18 @@ async fn job_status_hides_full_command_by_default() {
         })
         .await
         .expect("tools/call compact job_status failed");
-    let compact_text = text_from_calltool(compact);
+    let compact_json = json_of(compact);
     assert!(
-        compact_text.contains("Summary:"),
-        "missing summary: {compact_text}"
+        compact_json["summary"].is_string(),
+        "missing summary: {compact_json}"
     );
     assert!(
-        !compact_text.contains("Command:"),
-        "full command should be hidden by default: {compact_text}"
+        compact_json["command"].is_null(),
+        "full command should be hidden by default: {compact_json}"
     );
     assert!(
-        !compact_text.contains(long_marker),
-        "long command marker leaked without full_command=true: {compact_text}"
+        !compact_json.to_string().contains(long_marker),
+        "long command marker leaked without full_command=true: {compact_json}"
     );
 
     let verbose = client
@@ -738,14 +746,13 @@ async fn job_status_hides_full_command_by_default() {
         })
         .await
         .expect("tools/call verbose job_status failed");
-    let verbose_text = text_from_calltool(verbose);
+    let verbose_json = json_of(verbose);
     assert!(
-        verbose_text.contains("Command:"),
-        "missing full command: {verbose_text}"
-    );
-    assert!(
-        verbose_text.contains(long_marker),
-        "missing long marker: {verbose_text}"
+        verbose_json["command"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(long_marker),
+        "missing full command: {verbose_json}"
     );
 }
 
@@ -773,10 +780,9 @@ async fn job_status_uses_byte_explicit_pagination() {
         .await
         .expect("tools/call enhanced_terminal failed");
 
-    let run_text = text_from_calltool(run);
-    let job_id = run_text
-        .lines()
-        .find_map(|line| line.strip_prefix("Job ID: "))
+    let run_json = json_of(run);
+    let job_id = run_json["job_id"]
+        .as_str()
         .expect("missing job id")
         .to_string();
 
@@ -799,20 +805,22 @@ async fn job_status_uses_byte_explicit_pagination() {
         .await
         .expect("tools/call enhanced_terminal_job_status failed");
 
-    let text = text_from_calltool(status);
+    let status = json_of(status);
     assert!(
-        text.contains("Output Mode: Paginated (offset_bytes: 0, limit_bytes: 4)"),
-        "missing byte-explicit mode: {text}"
+        status["read"]["mode"] == json!("explicit"),
+        "missing byte-explicit mode: {status}"
+    );
+    assert_eq!(status["read"]["byte_start"], json!(0), "wrong byte start: {status}");
+    assert_eq!(status["read"]["byte_end"], json!(4), "wrong byte end: {status}");
+    assert_eq!(
+        status["read"]["next_offset_bytes"],
+        json!(4),
+        "missing next byte offset: {status}"
     );
     assert!(
-        text.contains("Returned Byte Range: 0..4 (requested end: 4)"),
-        "missing byte range metadata: {text}"
+        status["output"].as_str().unwrap_or_default().starts_with("abcd"),
+        "unexpected output: {status}"
     );
-    assert!(
-        text.contains("Next Offset Bytes: 4"),
-        "missing next byte offset: {text}"
-    );
-    assert!(text.contains("Output:\nabcd"), "unexpected output: {text}");
 }
 
 /// This test is opt-in because it may pop a GUI askpass prompt and requires a working desktop session.
@@ -915,8 +923,7 @@ async fn job_wait_returns_settled_job_with_json_payload() {
                     "command": "echo start; sleep 2; echo done",
                     "cwd": ".",
                     "force_async": true,
-                    "preview_tokens": 0,
-                    "response_format": "json"
+                    "preview_tokens": 0
                 }))
                 .expect("tool arguments must be a JSON object")
                 .into_iter()
